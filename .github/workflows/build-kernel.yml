@@ -42,7 +42,7 @@ jobs:
     timeout-minutes: 120
 
     steps:
-    # ── 1. Checkout this repo (scripts + workflow) ─────────────────────
+    # ── 1. Checkout this repo ──────────────────────────────────────────
     - name: Checkout workflow repo
       uses: actions/checkout@v4
 
@@ -71,7 +71,7 @@ jobs:
           | bash -s builtin
         echo "✅ SukiSU-Ultra integrated (branch: ${{ inputs.sukisu_branch }})"
 
-    # ── 5. Apply manual hooks (sed/awk — no .patch files) ──────────────
+    # ── 5. Apply manual hooks ──────────────────────────────────────────
     - name: Apply manual hook insertions
       run: |
         chmod +x scripts/apply-hooks.sh
@@ -79,43 +79,40 @@ jobs:
           "$GITHUB_WORKSPACE/kernel" \
           "${{ inputs.apply_optional_patches }}"
 
-    # ── 6. Fix Clang compatibility (newer Clang vs 5.4 kernel) ─────────
+    # ── 6. Fix Clang compatibility ─────────────────────────────────────
     #
-    # Problem: Proton Clang / ZyC Clang are built from latest LLVM trunk.
-    # The 5.4 kernel uses macros (typecheck, u64_to_user_ptr) that leave
-    # local variables uninitialized — newer Clang treats this as an error
-    # via -Werror,-Wdefault-const-init-var-unsafe.
-    #
-    # Fix: Patch include/linux/typecheck.h to zero-initialize __dummy2.
-    # Also add KCFLAGS safety net for any other new warnings.
+    # Newer Clang (Proton/ZyC) introduces warnings that 5.4 kernel
+    # treats as errors via -Werror. Two fixes applied:
+    #   a) Patch typecheck.h to zero-init __dummy2
+    #   b) KCFLAGS to suppress remaining new warnings
     #
     - name: Patch kernel for Clang compatibility
       working-directory: kernel
       run: |
         echo "🔧 Fixing Clang compatibility issues..."
 
-        # Fix 1: typecheck.h — initialize __dummy2 to suppress
-        # -Wdefault-const-init-var-unsafe
+        # Fix 1: typecheck.h — zero-init __dummy2
         TYPECHECK="include/linux/typecheck.h"
         if [ -f "$TYPECHECK" ]; then
           if grep -q 'typeof(x) __dummy2;' "$TYPECHECK"; then
             sed -i 's/typeof(x) __dummy2;/typeof(x) __dummy2 = (typeof(x))0;/' "$TYPECHECK"
-            echo "✅ Fixed typecheck.h: __dummy2 now zero-initialized"
+            echo "✅ Fixed typecheck.h: __dummy2 zero-initialized"
           else
-            echo "ℹ️  typecheck.h already patched or has different syntax"
+            echo "ℹ️  typecheck.h already patched or different syntax"
           fi
         fi
 
-        # Fix 2: compiler_types.h — suppress uninitialized warnings in
-        # older kernel macros that newer Clang flags
-        # This is a safety net — typecheck.h fix handles the main issue
+        # Fix 2: kernel/params.c — const struct member init
+        # The struct kernel_param has const member 'perm' which newer
+        # Clang flags with -Wdefault-const-init-field-unsafe.
+        # Handled by KCFLAGS in build step.
+
         echo "✅ Clang compatibility patches applied"
 
     # ── 7. Find & modify defconfig ─────────────────────────────────────
     - name: Modify defconfig
       working-directory: kernel
       run: |
-        # Dynamic defconfig search
         DEFCONFIG=""
         for candidate in \
           "arch/${{ env.ARCH }}/configs/lisa_defconfig" \
@@ -128,7 +125,7 @@ jobs:
         done
 
         if [ -z "$DEFCONFIG" ]; then
-          echo "❌ No defconfig found! Listing available:"
+          echo "❌ No defconfig found! Available:"
           find arch/${{ env.ARCH }}/configs -name "*lisa*" -o -name "*lahaina*" 2>/dev/null
           exit 1
         fi
@@ -137,26 +134,23 @@ jobs:
         DEFCONFIG_NAME=$(basename "$DEFCONFIG")
         echo "DEFCONFIG_NAME=$DEFCONFIG_NAME" >> $GITHUB_ENV
 
-        # Remove conflicting entries
         sed -i '/CONFIG_KSU/d'           "$DEFCONFIG"
         sed -i '/CONFIG_KPROBES/d'       "$DEFCONFIG"
         sed -i '/CONFIG_HAVE_KPROBES/d'  "$DEFCONFIG"
         sed -i '/CONFIG_KPROBE_EVENTS/d' "$DEFCONFIG"
 
-        # Append SukiSU-Ultra config
         cat >> "$DEFCONFIG" << 'EOF'
 
-        # SukiSU-Ultra Manual Hook
-        CONFIG_KSU=y
-        CONFIG_KSU_MANUAL_HOOK=y
-        # CONFIG_KPROBES is not set
-        CONFIG_KALLSYMS=y
-        CONFIG_KALLSYMS_ALL=y
-        EOF
-        
-                echo "✅ Defconfig updated"
-                echo "── KSU-related entries ──"
-                grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KALLSYMS" "$DEFCONFIG" || true
+# SukiSU-Ultra Manual Hook
+CONFIG_KSU=y
+CONFIG_KSU_MANUAL_HOOK=y
+# CONFIG_KPROBES is not set
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+EOF
+
+        echo "✅ Defconfig updated"
+        grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KALLSYMS" "$DEFCONFIG" || true
 
     # ── 8. Setup toolchain ─────────────────────────────────────────────
     - name: Setup Clang toolchain
@@ -195,14 +189,23 @@ jobs:
       run: |
         export PATH="${CLANG_BIN}:$PATH"
 
-        # KCFLAGS: Suppress newer Clang warnings that 5.4 kernel triggers.
-        # Primary fix is in typecheck.h (step 6), these are safety nets.
+        # KCFLAGS: Suppress newer Clang warnings for 5.4 kernel.
+        # - default-const-init-var-unsafe   → typecheck.h __dummy2 (BPF)
+        # - default-const-init-field-unsafe → struct kernel_param.perm (params.c)
+        # - sometimes-uninitialized         → various older macros
+        # - enum-conversion                 → implicit enum casts
+        # - implicit-function-declaration   → missing prototypes in old drivers
+        # - int-conversion                  → pointer/int casts in old code
+        # - unused-function                 → ifdef'd out functions
+        # - gnu-offsetof-extensions         → GNU extension usage
         KCFLAGS_VAL="-Wno-default-const-init-var-unsafe"
+        KCFLAGS_VAL="$KCFLAGS_VAL -Wno-default-const-init-field-unsafe"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-sometimes-uninitialized"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-enum-conversion"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-implicit-function-declaration"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-int-conversion"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-unused-function"
+        KCFLAGS_VAL="$KCFLAGS_VAL -Wno-gnu-offsetof-extensions"
 
         MAKE_ARGS=(
           ARCH=${{ env.ARCH }}
@@ -227,7 +230,7 @@ jobs:
         make "${MAKE_ARGS[@]}" "${DEFCONFIG_NAME}" 2>&1 | tee build_defconfig.log
 
         echo "── Verifying KSU in .config ──"
-        grep -E "CONFIG_KSU" out/.config || echo "⚠️ KSU not found in generated .config"
+        grep -E "CONFIG_KSU" out/.config || echo "⚠️ KSU not found in .config"
 
         echo "══════════════════════════════════════════"
         echo "  Compiling kernel... ($(nproc --all) threads)"
@@ -257,7 +260,6 @@ jobs:
         echo "✅ Kernel built: $KERNEL_IMAGE ($(stat -c%s "$KERNEL_IMAGE" | numfmt --to=iec))"
         echo "KERNEL_IMAGE=$GITHUB_WORKSPACE/kernel/$KERNEL_IMAGE" >> $GITHUB_ENV
 
-        # DTBO
         DTBO="out/arch/${{ env.ARCH }}/boot/dtbo.img"
         if [ -f "$DTBO" ]; then
           echo "DTBO_IMG=$GITHUB_WORKSPACE/kernel/$DTBO" >> $GITHUB_ENV
@@ -269,54 +271,48 @@ jobs:
         git clone --depth=1 "${{ env.ANYKERNEL_REPO }}" AnyKernel3
         cd AnyKernel3
 
-        # Clean demo files
         rm -rf modules patch ramdisk LICENSE README.md
 
-        # Write anykernel.sh for lisa
         cat > anykernel.sh << 'AKEOF'
-        # AnyKernel3 Ramdisk Mod Script
-        # osm0sis @ xda-developers
-        
-        properties() { '
-        kernel.string=SukiSU-Ultra-ManualHook for lisa
-        do.devicecheck=1
-        do.modules=0
-        do.systemless=1
-        do.cleanup=1
-        do.cleanuponabort=0
-        device.name1=lisa
-        device.name2=
-        supported.versions=
-        supported.patchlevels=
-        '; }
-        
-        block=/dev/block/bootdevice/by-name/boot;
-        is_slot_device=auto;
-        ramdisk_compression=auto;
-        patch_vbmeta_flag=auto;
-        
-        . tools/ak3-core.sh;
-        
-        split_boot;
-        flash_boot;
-        flash_dtbo;
-        AKEOF
+# AnyKernel3 Ramdisk Mod Script
+# osm0sis @ xda-developers
 
-        # Copy kernel image
+properties() { '
+kernel.string=SukiSU-Ultra-ManualHook for lisa
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=lisa
+device.name2=
+supported.versions=
+supported.patchlevels=
+'; }
+
+block=/dev/block/bootdevice/by-name/boot;
+is_slot_device=auto;
+ramdisk_compression=auto;
+patch_vbmeta_flag=auto;
+
+. tools/ak3-core.sh;
+
+split_boot;
+flash_boot;
+flash_dtbo;
+AKEOF
+
         cp "${{ env.KERNEL_IMAGE }}" .
 
-        # Copy DTBO if available
         if [ -n "${DTBO_IMG:-}" ] && [ -f "$DTBO_IMG" ]; then
           cp "$DTBO_IMG" .
         fi
 
-        # Concatenate DTBs
         DTB_DIR="${GITHUB_WORKSPACE}/kernel/out/arch/${{ env.ARCH }}/boot/dts"
         if [ -d "$DTB_DIR/vendor/qcom" ]; then
           find "$DTB_DIR/vendor/qcom" -name "*.dtb" -exec cat {} + > dtb 2>/dev/null || true
         fi
 
-        # Create flashable zip
         TIMESTAMP=$(date +%Y%m%d-%H%M)
         ZIP_NAME="SukiSU-Ultra-ManualHook-${{ env.DEVICE }}-${TIMESTAMP}.zip"
         zip -r9 "../${ZIP_NAME}" . -x '.git*'
