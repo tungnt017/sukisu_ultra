@@ -142,30 +142,30 @@ jobs:
         if [ ! -f "include/linux/susfs.h" ]; then
           echo "📝 Creating stub include/linux/susfs.h"
           cat > include/linux/susfs.h << 'STUBEOF'
-#ifndef _LINUX_SUSFS_H
-#define _LINUX_SUSFS_H
-#include <linux/types.h>
-#endif /* _LINUX_SUSFS_H */
-STUBEOF
-        fi
-
-        if [ ! -f "include/linux/susfs_def.h" ]; then
-          echo "📝 Creating stub include/linux/susfs_def.h"
-          cat > include/linux/susfs_def.h << 'STUBEOF'
-#ifndef _LINUX_SUSFS_DEF_H
-#define _LINUX_SUSFS_DEF_H
-#endif /* _LINUX_SUSFS_DEF_H */
-STUBEOF
-        fi
-
-        if [ ! -f "include/linux/susfs_redirect.h" ]; then
-          echo "📝 Creating stub include/linux/susfs_redirect.h"
-          cat > include/linux/susfs_redirect.h << 'STUBEOF'
-#ifndef _LINUX_SUSFS_REDIRECT_H
-#define _LINUX_SUSFS_REDIRECT_H
-#endif /* _LINUX_SUSFS_REDIRECT_H */
-STUBEOF
-        fi
+        #ifndef _LINUX_SUSFS_H
+        #define _LINUX_SUSFS_H
+        #include <linux/types.h>
+        #endif /* _LINUX_SUSFS_H */
+        STUBEOF
+                fi
+        
+                if [ ! -f "include/linux/susfs_def.h" ]; then
+                  echo "📝 Creating stub include/linux/susfs_def.h"
+                  cat > include/linux/susfs_def.h << 'STUBEOF'
+        #ifndef _LINUX_SUSFS_DEF_H
+        #define _LINUX_SUSFS_DEF_H
+        #endif /* _LINUX_SUSFS_DEF_H */
+        STUBEOF
+                fi
+        
+                if [ ! -f "include/linux/susfs_redirect.h" ]; then
+                  echo "📝 Creating stub include/linux/susfs_redirect.h"
+                  cat > include/linux/susfs_redirect.h << 'STUBEOF'
+        #ifndef _LINUX_SUSFS_REDIRECT_H
+        #define _LINUX_SUSFS_REDIRECT_H
+        #endif /* _LINUX_SUSFS_REDIRECT_H */
+        STUBEOF
+                fi
 
         echo "SUSFS_APPLIED=$SUSFS_APPLIED" >> $GITHUB_ENV
 
@@ -248,13 +248,13 @@ STUBEOF
         # Append SukiSU-Ultra config
         cat >> "$DEFCONFIG" << 'EOF'
 
-# SukiSU-Ultra Manual Hook
-CONFIG_KSU=y
-CONFIG_KSU_MANUAL_HOOK=y
-# CONFIG_KPROBES is not set
-CONFIG_KALLSYMS=y
-CONFIG_KALLSYMS_ALL=y
-EOF
+        # SukiSU-Ultra Manual Hook
+        CONFIG_KSU=y
+        CONFIG_KSU_MANUAL_HOOK=y
+        # CONFIG_KPROBES is not set
+        CONFIG_KALLSYMS=y
+        CONFIG_KALLSYMS_ALL=y
+        EOF
 
         # SUSFS config
         if [ "${SUSFS_APPLIED:-false}" = "true" ]; then
@@ -384,33 +384,33 @@ EOF
         rm -rf modules patch ramdisk LICENSE README.md
 
         cat > anykernel.sh << 'AKEOF'
-# AnyKernel3 Ramdisk Mod Script
-# osm0sis @ xda-developers
-
-properties() { '
-kernel.string=SukiSU-Ultra-ManualHook for lisa
-do.devicecheck=1
-do.modules=0
-do.systemless=1
-do.cleanup=1
-do.cleanuponabort=0
-device.name1=lisa
-device.name2=
-supported.versions=
-supported.patchlevels=
-'; }
-
-block=/dev/block/bootdevice/by-name/boot;
-is_slot_device=auto;
-ramdisk_compression=auto;
-patch_vbmeta_flag=auto;
-
-. tools/ak3-core.sh;
-
-split_boot;
-flash_boot;
-flash_dtbo;
-AKEOF
+        # AnyKernel3 Ramdisk Mod Script
+        # osm0sis @ xda-developers
+        
+        properties() { '
+        kernel.string=SukiSU-Ultra-ManualHook for lisa
+        do.devicecheck=1
+        do.modules=0
+        do.systemless=1
+        do.cleanup=1
+        do.cleanuponabort=0
+        device.name1=lisa
+        device.name2=
+        supported.versions=
+        supported.patchlevels=
+        '; }
+        
+        block=/dev/block/bootdevice/by-name/boot;
+        is_slot_device=auto;
+        ramdisk_compression=auto;
+        patch_vbmeta_flag=auto;
+        
+        . tools/ak3-core.sh;
+        
+        split_boot;
+        flash_boot;
+        flash_dtbo;
+        AKEOF
 
         cp "${{ env.KERNEL_IMAGE }}" .
 
