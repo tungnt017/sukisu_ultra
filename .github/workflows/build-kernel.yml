@@ -114,17 +114,17 @@ jobs:
         # Append SukiSU-Ultra config
         cat >> "$DEFCONFIG" << 'EOF'
 
-# SukiSU-Ultra Manual Hook
-CONFIG_KSU=y
-CONFIG_KSU_MANUAL_HOOK=y
-# CONFIG_KPROBES is not set
-CONFIG_KALLSYMS=y
-CONFIG_KALLSYMS_ALL=y
-EOF
-
-        echo "✅ Defconfig updated"
-        echo "── KSU-related entries ──"
-        grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KALLSYMS" "$DEFCONFIG" || true
+        # SukiSU-Ultra Manual Hook
+        CONFIG_KSU=y
+        CONFIG_KSU_MANUAL_HOOK=y
+        # CONFIG_KPROBES is not set
+        CONFIG_KALLSYMS=y
+        CONFIG_KALLSYMS_ALL=y
+        EOF
+        
+                echo "✅ Defconfig updated"
+                echo "── KSU-related entries ──"
+                grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KALLSYMS" "$DEFCONFIG" || true
 
     # ── 7. Setup toolchain ─────────────────────────────────────────────
     - name: Setup Clang toolchain
@@ -231,33 +231,33 @@ EOF
 
         # Write anykernel.sh for lisa
         cat > anykernel.sh << 'AKEOF'
-# AnyKernel3 Ramdisk Mod Script
-# osm0sis @ xda-developers
-
-properties() { '
-kernel.string=SukiSU-Ultra-ManualHook for lisa
-do.devicecheck=1
-do.modules=0
-do.systemless=1
-do.cleanup=1
-do.cleanuponabort=0
-device.name1=lisa
-device.name2=
-supported.versions=
-supported.patchlevels=
-'; }
-
-block=/dev/block/bootdevice/by-name/boot;
-is_slot_device=auto;
-ramdisk_compression=auto;
-patch_vbmeta_flag=auto;
-
-. tools/ak3-core.sh;
-
-split_boot;
-flash_boot;
-flash_dtbo;
-AKEOF
+        # AnyKernel3 Ramdisk Mod Script
+        # osm0sis @ xda-developers
+        
+        properties() { '
+        kernel.string=SukiSU-Ultra-ManualHook for lisa
+        do.devicecheck=1
+        do.modules=0
+        do.systemless=1
+        do.cleanup=1
+        do.cleanuponabort=0
+        device.name1=lisa
+        device.name2=
+        supported.versions=
+        supported.patchlevels=
+        '; }
+        
+        block=/dev/block/bootdevice/by-name/boot;
+        is_slot_device=auto;
+        ramdisk_compression=auto;
+        patch_vbmeta_flag=auto;
+        
+        . tools/ak3-core.sh;
+        
+        split_boot;
+        flash_boot;
+        flash_dtbo;
+        AKEOF
 
         # Copy kernel image
         cp "${{ env.KERNEL_IMAGE }}" .
