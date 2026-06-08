@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════════════
-# SukiSU-Ultra Manual Hook Inserter (sed-based, no .patch files)
+# SukiSU-Ultra Manual Hook Inserter (sed/awk-based, no .patch files)
 # For: kernel_xiaomi_lisa (5.4.x non-GKI)
 # ═══════════════════════════════════════════════════════════════════════
 set -euo pipefail
@@ -17,54 +17,6 @@ NC='\033[0m'
 ok()   { echo -e "${GREEN}✅ $1${NC}"; }
 warn() { echo -e "${YELLOW}⚠️  $1${NC}"; }
 fail() { echo -e "${RED}❌ $1${NC}"; FAIL=1; }
-
-# Helper: insert text BEFORE a matched line (first match only)
-insert_before() {
-    local file="$1" pattern="$2" text="$3"
-    local line
-    line=$(grep -n "$pattern" "$file" | head -1 | cut -d: -f1)
-    if [ -z "$line" ]; then
-        fail "Pattern not found in $file: $pattern"
-        return 1
-    fi
-    sed -i "${line}i\\${text}" "$file"
-}
-
-# Helper: insert text AFTER a matched line (first match only)
-insert_after() {
-    local file="$1" pattern="$2" text="$3"
-    local line
-    line=$(grep -n "$pattern" "$file" | head -1 | cut -d: -f1)
-    if [ -z "$line" ]; then
-        fail "Pattern not found in $file: $pattern"
-        return 1
-    fi
-    sed -i "${line}a\\${text}" "$file"
-}
-
-# Helper: insert text BEFORE the Nth match
-insert_before_nth() {
-    local file="$1" pattern="$2" text="$3" nth="$4"
-    local line
-    line=$(grep -n "$pattern" "$file" | sed -n "${nth}p" | cut -d: -f1)
-    if [ -z "$line" ]; then
-        fail "Pattern (match #$nth) not found in $file: $pattern"
-        return 1
-    fi
-    sed -i "${line}i\\${text}" "$file"
-}
-
-# Helper: insert text AFTER the Nth match
-insert_after_nth() {
-    local file="$1" pattern="$2" text="$3" nth="$4"
-    local line
-    line=$(grep -n "$pattern" "$file" | sed -n "${nth}p" | cut -d: -f1)
-    if [ -z "$line" ]; then
-        fail "Pattern (match #$nth) not found in $file: $pattern"
-        return 1
-    fi
-    sed -i "${line}a\\${text}" "$file"
-}
 
 verify() {
     local file="$1" marker="$2"
@@ -89,49 +41,6 @@ hook_exec() {
         return 0
     fi
 
-    # --- Part A: extern declarations BEFORE do_execve ---
-    local EXTERN_BLOCK
-    EXTERN_BLOCK=$(cat <<'CEOF'
-#if defined(CONFIG_KSU) && defined(CONFIG_KSU_MANUAL_HOOK)
-extern bool ksu_execveat_hook __read_mostly;
-extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr, void *argv,\
-			void *envp, int *flags);
-extern int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,\
-				void *argv, void *envp, int *flags);
-#endif
-
-CEOF
-)
-    # Find "int do_execve(" or "static int do_execve(" — first occurrence
-    local do_execve_line
-    do_execve_line=$(grep -n "^int do_execve\|^static int do_execve" "$F" | head -1 | cut -d: -f1)
-    if [ -z "$do_execve_line" ]; then
-        # Fallback: less strict search
-        do_execve_line=$(grep -n "do_execve(struct filename" "$F" | grep -v "compat\|common\|__do" | head -1 | cut -d: -f1)
-    fi
-
-    if [ -z "$do_execve_line" ]; then
-        fail "Cannot find do_execve in fs/exec.c"
-        return 1
-    fi
-
-    # Write extern block to temp file and insert
-    local tmpfile
-    tmpfile=$(mktemp)
-    echo "$EXTERN_BLOCK" > "$tmpfile"
-    sed -i "$((do_execve_line))r $tmpfile" "$F"
-    # Actually we need to insert BEFORE, so use a different approach
-    # Re-read and use ed-style
-    # Simpler: use sed with line number insert
-    # Since we already inserted AFTER, let's redo:
-    # Restore and use proper method
-    git checkout -- "$F" 2>/dev/null || true
-    rm -f "$tmpfile"
-
-    # Better approach: build the full insertion as escaped newlines for sed
-    # Use awk for multi-line insertion (more robust)
-
-    # Step 1: Insert extern block before do_execve
     awk -v inserted=0 '
     /^int do_execve\(|^static int do_execve\(/ && inserted==0 {
         print "#if defined(CONFIG_KSU) && defined(CONFIG_KSU_MANUAL_HOOK)"
@@ -147,8 +56,6 @@ CEOF
     { print }
     ' "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
 
-    # Step 2: Insert hook call inside do_execve, after "struct user_arg_ptr envp"
-    # Find the envp line inside do_execve (not compat version)
     awk '
     /^int do_execve\(|^static int do_execve\(/ { in_do_execve=1 }
     in_do_execve && /struct user_arg_ptr envp = \{ \.ptr\.native/ {
@@ -165,8 +72,6 @@ CEOF
     { print }
     ' "$F" > "${F}.tmp" && mv "${F}.tmp" "$F"
 
-    # Step 3: Insert 32-bit compat hook inside compat_do_execve
-    # Find compat_do_execve, then its "return do_execveat_common" line
     awk '
     /^int compat_do_execve\(|^static int compat_do_execve\(/ { in_compat=1 }
     in_compat && /return do_execveat_common/ {
@@ -197,7 +102,6 @@ hook_open() {
         return 0
     fi
 
-    # Step 1: Insert extern + hook around SYSCALL_DEFINE3(faccessat,
     awk '
     /SYSCALL_DEFINE3\(faccessat,/ {
         print "#if defined(CONFIG_KSU) && defined(CONFIG_KSU_MANUAL_HOOK)"
@@ -234,8 +138,6 @@ hook_read_write() {
         return 0
     fi
 
-    # Step 1: Insert extern before SYSCALL_DEFINE3(read,
-    # Step 2: Insert hook call before return ksys_read
     awk '
     /SYSCALL_DEFINE3\(read, unsigned int, fd,/ {
         print "#if defined(CONFIG_KSU) && defined(CONFIG_KSU_MANUAL_HOOK)"
@@ -274,8 +176,6 @@ hook_stat() {
         return 0
     fi
 
-    # Insert extern before SYSCALL_DEFINE4(newfstatat,
-    # Insert hook before error = vfs_fstatat inside newfstatat
     awk '
     /SYSCALL_DEFINE4\(newfstatat,/ {
         print "#if defined(CONFIG_KSU) && defined(CONFIG_KSU_MANUAL_HOOK)"
@@ -351,13 +251,11 @@ echo "Kernel dir: $KERNEL_DIR"
 echo "Optional:   $OPTIONAL"
 echo ""
 
-# Required hooks
 hook_exec
 hook_open
 hook_read_write
 hook_stat
 
-# Optional hooks
 if [ "$OPTIONAL" = "true" ] || [ "$OPTIONAL" = "--optional" ]; then
     hook_input
 fi
