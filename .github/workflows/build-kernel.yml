@@ -13,7 +13,7 @@ on:
           - susfs-main
           - susfs-test
       apply_optional_patches:
-        description: 'Apply optional patches (input hook + path_umount)'
+        description: 'Apply optional patches (input hook for Safe Mode)'
         required: false
         default: 'false'
         type: choice
@@ -33,7 +33,6 @@ env:
   KERNEL_REPO: https://github.com/PixelExperience-Devices/kernel_xiaomi_lisa
   KERNEL_BRANCH: thirteen
   DEVICE: lisa
-  DEFCONFIG: lisa_defconfig
   ARCH: arm64
   ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3
 
@@ -43,7 +42,7 @@ jobs:
     timeout-minutes: 120
 
     steps:
-    # ── 1. Checkout this repo (patches + workflow) ─────────────────────
+    # ── 1. Checkout this repo (scripts + workflow) ─────────────────────
     - name: Checkout workflow repo
       uses: actions/checkout@v4
 
@@ -72,98 +71,60 @@ jobs:
           | bash -s builtin
         echo "✅ SukiSU-Ultra integrated (branch: ${{ inputs.sukisu_branch }})"
 
-    # ── 5. Apply manual hook patches ───────────────────────────────────
-    - name: Apply manual hook patches
-      working-directory: kernel
+    # ── 5. Apply manual hooks (sed/awk — no .patch files) ──────────────
+    - name: Apply manual hook insertions
       run: |
-        apply_patch() {
-          local patch_file="$1"
-          local patch_name=$(basename "$patch_file")
-          echo "──────────────────────────────────────────"
-          echo "📌 Applying: $patch_name"
+        chmod +x scripts/apply-hooks.sh
+        bash scripts/apply-hooks.sh \
+          "$GITHUB_WORKSPACE/kernel" \
+          "${{ inputs.apply_optional_patches }}"
 
-          # Level 1: git apply (strict)
-          if git apply --check "$patch_file" 2>/dev/null; then
-            git apply "$patch_file"
-            echo "✅ $patch_name applied (git apply)"
-            return 0
-          fi
-
-          # Level 2: git apply --3way (fuzzy)
-          if git apply --3way "$patch_file" 2>/dev/null; then
-            echo "✅ $patch_name applied (git apply --3way)"
-            return 0
-          fi
-
-          # Level 3: patch -p1 (traditional)
-          if patch -p1 --forward --no-backup-if-mismatch < "$patch_file"; then
-            echo "✅ $patch_name applied (patch -p1)"
-            return 0
-          fi
-
-          echo "❌ FAILED to apply: $patch_name"
-          return 1
-        }
-
-        PATCH_DIR="${GITHUB_WORKSPACE}/patches"
-
-        # Required patches
-        for p in 01-exec-hook.patch 02-open-hook.patch \
-                 03-read_write-hook.patch 04-stat-hook.patch; do
-          apply_patch "$PATCH_DIR/$p"
-        done
-
-        # Optional patches
-        if [ "${{ inputs.apply_optional_patches }}" = "true" ]; then
-          for p in 05-input-hook.patch; do
-            apply_patch "$PATCH_DIR/$p" || true
-          done
-        fi
-
-        echo "✅ All patches applied"
-
-    # ── 6. Modify defconfig ────────────────────────────────────────────
+    # ── 6. Find & modify defconfig ─────────────────────────────────────
     - name: Modify defconfig
       working-directory: kernel
       run: |
-        DEFCONFIG_PATH="arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG }}"
-
-        if [ ! -f "$DEFCONFIG_PATH" ]; then
-          echo "❌ Defconfig not found at $DEFCONFIG_PATH"
-          # Fallback: search for it
-          DEFCONFIG_PATH=$(find arch/${{ env.ARCH }}/configs -name "${{ env.DEFCONFIG }}" | head -1)
-          if [ -z "$DEFCONFIG_PATH" ]; then
-            echo "❌ Cannot find ${{ env.DEFCONFIG }} anywhere!"
-            exit 1
+        # Dynamic defconfig search (device-specific → generic fallback)
+        DEFCONFIG=""
+        for candidate in \
+          "arch/${{ env.ARCH }}/configs/lisa_defconfig" \
+          "arch/${{ env.ARCH }}/configs/vendor/lahaina-qgki_defconfig" \
+          "arch/${{ env.ARCH }}/configs/vendor/lisa_defconfig"; do
+          if [ -f "$candidate" ]; then
+            DEFCONFIG="$candidate"
+            break
           fi
-          echo "📌 Found defconfig at: $DEFCONFIG_PATH"
+        done
+
+        if [ -z "$DEFCONFIG" ]; then
+          echo "❌ No defconfig found! Listing available:"
+          find arch/${{ env.ARCH }}/configs -name "*lisa*" -o -name "*lahaina*" 2>/dev/null
+          exit 1
         fi
 
-        echo "📝 Modifying: $DEFCONFIG_PATH"
+        echo "📝 Using defconfig: $DEFCONFIG"
+        DEFCONFIG_NAME=$(basename "$DEFCONFIG")
+        echo "DEFCONFIG_NAME=$DEFCONFIG_NAME" >> $GITHUB_ENV
 
         # Remove conflicting entries
-        sed -i '/CONFIG_KSU/d' "$DEFCONFIG_PATH"
-        sed -i '/CONFIG_KPROBES/d' "$DEFCONFIG_PATH"
-        sed -i '/CONFIG_HAVE_KPROBES/d' "$DEFCONFIG_PATH"
-        sed -i '/CONFIG_KPROBE_EVENTS/d' "$DEFCONFIG_PATH"
+        sed -i '/CONFIG_KSU/d'          "$DEFCONFIG"
+        sed -i '/CONFIG_KPROBES/d'      "$DEFCONFIG"
+        sed -i '/CONFIG_HAVE_KPROBES/d' "$DEFCONFIG"
+        sed -i '/CONFIG_KPROBE_EVENTS/d' "$DEFCONFIG"
 
         # Append SukiSU-Ultra config
-        cat >> "$DEFCONFIG_PATH" << 'EOF'
+        cat >> "$DEFCONFIG" << 'EOF'
 
-        # SukiSU-Ultra Manual Hook
-        CONFIG_KSU=y
-        CONFIG_KSU_MANUAL_HOOK=y
-        # CONFIG_KPROBES is not set
-        CONFIG_KALLSYMS=y
-        CONFIG_KALLSYMS_ALL=y
-        EOF
-
-        # Remove leading whitespace from appended lines
-        sed -i 's/^        //' "$DEFCONFIG_PATH"
+# SukiSU-Ultra Manual Hook
+CONFIG_KSU=y
+CONFIG_KSU_MANUAL_HOOK=y
+# CONFIG_KPROBES is not set
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+EOF
 
         echo "✅ Defconfig updated"
-        echo "── Checking KSU-related entries ──"
-        grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KALLSYMS" "$DEFCONFIG_PATH" || true
+        echo "── KSU-related entries ──"
+        grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KALLSYMS" "$DEFCONFIG" || true
 
     # ── 7. Setup toolchain ─────────────────────────────────────────────
     - name: Setup Clang toolchain
@@ -185,11 +146,16 @@ jobs:
           rm -f zyc-clang.tar.gz
         fi
 
-        # Verify clang
         CLANG_BIN="$GITHUB_WORKSPACE/toolchain/clang/bin"
         echo "PATH=$CLANG_BIN:$PATH" >> $GITHUB_ENV
         echo "CLANG_BIN=$CLANG_BIN" >> $GITHUB_ENV
-        ls "$CLANG_BIN/clang" && echo "✅ Clang ready" || echo "❌ Clang not found"
+
+        if [ -f "$CLANG_BIN/clang" ]; then
+          echo "✅ Clang ready: $("$CLANG_BIN/clang" --version | head -1)"
+        else
+          echo "❌ Clang binary not found!"
+          exit 1
+        fi
 
     # ── 8. Build kernel ────────────────────────────────────────────────
     - name: Build kernel
@@ -214,99 +180,94 @@ jobs:
         )
 
         echo "══════════════════════════════════════════"
-        echo "  Building: ${{ env.DEFCONFIG }}"
+        echo "  Generating config: ${DEFCONFIG_NAME}"
         echo "══════════════════════════════════════════"
+        make "${MAKE_ARGS[@]}" "${DEFCONFIG_NAME}" 2>&1 | tee build_defconfig.log
 
-        # Generate .config
-        make "${MAKE_ARGS[@]}" ${{ env.DEFCONFIG }} 2>&1 | tee build_defconfig.log
+        echo "── Verifying KSU in .config ──"
+        grep -E "CONFIG_KSU" out/.config || echo "⚠️ KSU not found in generated .config"
 
-        # Verify KSU config
-        echo "── Checking .config for KSU ──"
-        grep -E "CONFIG_KSU" out/.config || true
-
-        # Build kernel image + DTBs
         echo "══════════════════════════════════════════"
         echo "  Compiling kernel..."
         echo "══════════════════════════════════════════"
         make "${MAKE_ARGS[@]}" -j$(nproc --all) 2>&1 | tee build_kernel.log
 
-        # Check output
-        KERNEL_IMAGE="out/arch/${{ env.ARCH }}/boot/Image"
-        if [ -f "$KERNEL_IMAGE" ]; then
-          echo "✅ Kernel Image built successfully!"
-          ls -lh "$KERNEL_IMAGE"
-        elif [ -f "out/arch/${{ env.ARCH }}/boot/Image.gz" ]; then
-          KERNEL_IMAGE="out/arch/${{ env.ARCH }}/boot/Image.gz"
-          echo "✅ Kernel Image.gz built successfully!"
-          ls -lh "$KERNEL_IMAGE"
-        else
+        # Locate output
+        KERNEL_IMAGE=""
+        for img in \
+          "out/arch/${{ env.ARCH }}/boot/Image" \
+          "out/arch/${{ env.ARCH }}/boot/Image.gz" \
+          "out/arch/${{ env.ARCH }}/boot/Image.gz-dtb"; do
+          if [ -f "$img" ]; then
+            KERNEL_IMAGE="$img"
+            break
+          fi
+        done
+
+        if [ -z "$KERNEL_IMAGE" ]; then
           echo "❌ Kernel build FAILED — no Image found!"
-          echo "── Last 50 lines of build log ──"
-          tail -50 build_kernel.log
+          echo "── Last 80 lines of build log ──"
+          tail -80 build_kernel.log
           exit 1
         fi
 
-        echo "KERNEL_IMAGE=$KERNEL_IMAGE" >> $GITHUB_ENV
+        echo "✅ Kernel built: $KERNEL_IMAGE ($(stat -c%s "$KERNEL_IMAGE" | numfmt --to=iec))"
+        echo "KERNEL_IMAGE=$GITHUB_WORKSPACE/kernel/$KERNEL_IMAGE" >> $GITHUB_ENV
 
-        # Collect DTBs (if any)
-        DTB_DIR="out/arch/${{ env.ARCH }}/boot/dts"
-        DTBO_IMG="out/arch/${{ env.ARCH }}/boot/dtbo.img"
-        if [ -f "$DTBO_IMG" ]; then
-          echo "DTBO_IMG=$DTBO_IMG" >> $GITHUB_ENV
+        # DTBO
+        DTBO="out/arch/${{ env.ARCH }}/boot/dtbo.img"
+        if [ -f "$DTBO" ]; then
+          echo "DTBO_IMG=$GITHUB_WORKSPACE/kernel/$DTBO" >> $GITHUB_ENV
         fi
 
-    # ── 9. Package with AnyKernel3 ─────────────────────────────────────
+    # ── 9. Package AnyKernel3 ──────────────────────────────────────────
     - name: Package AnyKernel3 flashable zip
       run: |
         git clone --depth=1 "${{ env.ANYKERNEL_REPO }}" AnyKernel3
-
         cd AnyKernel3
 
         # Clean demo files
         rm -rf modules patch ramdisk LICENSE README.md
 
-        # Configure anykernel.sh for lisa
+        # Write anykernel.sh for lisa
         cat > anykernel.sh << 'AKEOF'
-        # AnyKernel3 Ramdisk Mod Script
-        # osm0sis @ xda-developers
+# AnyKernel3 Ramdisk Mod Script
+# osm0sis @ xda-developers
 
-        properties() { '
-        kernel.string=SukiSU-Ultra-ManualHook for lisa
-        do.devicecheck=1
-        do.modules=0
-        do.systemless=1
-        do.cleanup=1
-        do.cleanuponabort=0
-        device.name1=lisa
-        device.name2=
-        supported.versions=
-        supported.patchlevels=
-        '; }
+properties() { '
+kernel.string=SukiSU-Ultra-ManualHook for lisa
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=lisa
+device.name2=
+supported.versions=
+supported.patchlevels=
+'; }
 
-        block=/dev/block/bootdevice/by-name/boot;
-        is_slot_device=auto;
-        ramdisk_compression=auto;
-        patch_vbmeta_flag=auto;
+block=/dev/block/bootdevice/by-name/boot;
+is_slot_device=auto;
+ramdisk_compression=auto;
+patch_vbmeta_flag=auto;
 
-        . tools/ak3-core.sh;
+. tools/ak3-core.sh;
 
-        split_boot;
-        flash_boot;
-        flash_dtbo;
-        AKEOF
-
-        # Remove leading whitespace
-        sed -i 's/^        //' anykernel.sh
+split_boot;
+flash_boot;
+flash_dtbo;
+AKEOF
 
         # Copy kernel image
         cp "${{ env.KERNEL_IMAGE }}" .
 
         # Copy DTBO if available
-        if [ -n "${{ env.DTBO_IMG }}" ] && [ -f "${{ env.DTBO_IMG }}" ]; then
-          cp "${{ env.DTBO_IMG }}" .
+        if [ -n "${DTBO_IMG:-}" ] && [ -f "$DTBO_IMG" ]; then
+          cp "$DTBO_IMG" .
         fi
 
-        # Copy DTBs if present
+        # Concatenate DTBs (if present)
         DTB_DIR="${GITHUB_WORKSPACE}/kernel/out/arch/${{ env.ARCH }}/boot/dts"
         if [ -d "$DTB_DIR/vendor/qcom" ]; then
           find "$DTB_DIR/vendor/qcom" -name "*.dtb" -exec cat {} + > dtb 2>/dev/null || true
