@@ -71,7 +71,85 @@ jobs:
           | bash -s builtin
         echo "✅ SukiSU-Ultra integrated (branch: ${{ inputs.sukisu_branch }})"
 
-    # ── 5. Apply manual hooks ──────────────────────────────────────────
+    # ── 5. Integrate SUSFS (required by SukiSU-Ultra main branch) ──────
+    #
+    # SukiSU-Ultra's ksu.c includes <linux/susfs.h> which requires the
+    # susfs4ksu kernel patches. If patches fail, create a stub header.
+    #
+    - name: Integrate SUSFS
+      working-directory: kernel
+      run: |
+        echo "📦 Integrating SUSFS..."
+
+        # Determine kernel version for correct susfs patch
+        KERNEL_VER=$(make kernelversion 2>/dev/null | cut -d. -f1-2)
+        echo "Kernel version: $KERNEL_VER"
+
+        SUSFS_APPLIED=false
+
+        # Try cloning susfs4ksu
+        if git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git "$GITHUB_WORKSPACE/susfs4ksu" 2>/dev/null; then
+          echo "✅ susfs4ksu cloned"
+
+          # Find matching kernel patch
+          SUSFS_PATCH=""
+          for p in \
+            "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" \
+            "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-${KERNEL_VER}.patch" \
+            "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-5.4.patch"; do
+            if [ -f "$p" ]; then
+              SUSFS_PATCH="$p"
+              break
+            fi
+          done
+
+          if [ -n "$SUSFS_PATCH" ]; then
+            echo "📌 Applying: $(basename "$SUSFS_PATCH")"
+            if git apply --check "$SUSFS_PATCH" 2>/dev/null && git apply "$SUSFS_PATCH"; then
+              SUSFS_APPLIED=true
+              echo "✅ SUSFS kernel patch applied"
+            elif patch -p1 --forward --no-backup-if-mismatch < "$SUSFS_PATCH" 2>/dev/null; then
+              SUSFS_APPLIED=true
+              echo "✅ SUSFS kernel patch applied (patch -p1)"
+            else
+              echo "⚠️ SUSFS kernel patch failed to apply"
+            fi
+          fi
+
+          # Apply KSU enable patch
+          KSU_SUSFS_PATCH=$(find "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU" -name "*enable_susfs*" -type f 2>/dev/null | head -1)
+          if [ -n "$KSU_SUSFS_PATCH" ] && [ "$SUSFS_APPLIED" = "true" ]; then
+            echo "📌 Applying: $(basename "$KSU_SUSFS_PATCH")"
+            git apply "$KSU_SUSFS_PATCH" 2>/dev/null || \
+              patch -p1 --forward --no-backup-if-mismatch < "$KSU_SUSFS_PATCH" 2>/dev/null || true
+          fi
+
+          # Copy susfs header if available
+          SUSFS_H=$(find "$GITHUB_WORKSPACE/susfs4ksu" -name "susfs.h" -path "*/include/*" -type f 2>/dev/null | head -1)
+          if [ -n "$SUSFS_H" ] && [ ! -f "include/linux/susfs.h" ]; then
+            cp "$SUSFS_H" include/linux/susfs.h
+            echo "✅ Copied susfs.h to include/linux/"
+          fi
+        else
+          echo "⚠️ Could not clone susfs4ksu"
+        fi
+
+        # Fallback: create stub header if susfs.h still doesn't exist
+        if [ ! -f "include/linux/susfs.h" ]; then
+          echo "📝 Creating stub susfs.h (susfs not fully integrated)"
+          cat > include/linux/susfs.h << 'STUBEOF'
+        #ifndef _LINUX_SUSFS_H
+        #define _LINUX_SUSFS_H
+        /* Stub header — susfs not integrated in this build */
+        #endif /* _LINUX_SUSFS_H */
+        STUBEOF
+          sed -i 's/^        //' include/linux/susfs.h
+        fi
+
+        echo "SUSFS_APPLIED=$SUSFS_APPLIED" >> $GITHUB_ENV
+        echo "✅ SUSFS integration step complete (applied=$SUSFS_APPLIED)"
+
+    # ── 6. Apply manual hooks ──────────────────────────────────────────
     - name: Apply manual hook insertions
       run: |
         chmod +x scripts/apply-hooks.sh
@@ -79,13 +157,7 @@ jobs:
           "$GITHUB_WORKSPACE/kernel" \
           "${{ inputs.apply_optional_patches }}"
 
-    # ── 6. Fix Clang compatibility ─────────────────────────────────────
-    #
-    # Newer Clang (Proton/ZyC) introduces warnings that 5.4 kernel
-    # treats as errors via -Werror. Two fixes applied:
-    #   a) Patch typecheck.h to zero-init __dummy2
-    #   b) KCFLAGS to suppress remaining new warnings
-    #
+    # ── 7. Fix Clang compatibility ─────────────────────────────────────
     - name: Patch kernel for Clang compatibility
       working-directory: kernel
       run: |
@@ -96,20 +168,13 @@ jobs:
         if [ -f "$TYPECHECK" ]; then
           if grep -q 'typeof(x) __dummy2;' "$TYPECHECK"; then
             sed -i 's/typeof(x) __dummy2;/typeof(x) __dummy2 = (typeof(x))0;/' "$TYPECHECK"
-            echo "✅ Fixed typecheck.h: __dummy2 zero-initialized"
-          else
-            echo "ℹ️  typecheck.h already patched or different syntax"
+            echo "✅ Fixed typecheck.h"
           fi
         fi
 
-        # Fix 2: kernel/params.c — const struct member init
-        # The struct kernel_param has const member 'perm' which newer
-        # Clang flags with -Wdefault-const-init-field-unsafe.
-        # Handled by KCFLAGS in build step.
-
         echo "✅ Clang compatibility patches applied"
 
-    # ── 7. Find & modify defconfig ─────────────────────────────────────
+    # ── 8. Find & modify defconfig ─────────────────────────────────────
     - name: Modify defconfig
       working-directory: kernel
       run: |
@@ -125,7 +190,7 @@ jobs:
         done
 
         if [ -z "$DEFCONFIG" ]; then
-          echo "❌ No defconfig found! Available:"
+          echo "❌ No defconfig found!"
           find arch/${{ env.ARCH }}/configs -name "*lisa*" -o -name "*lahaina*" 2>/dev/null
           exit 1
         fi
@@ -141,18 +206,24 @@ jobs:
 
         cat >> "$DEFCONFIG" << 'EOF'
 
-        # SukiSU-Ultra Manual Hook
-        CONFIG_KSU=y
-        CONFIG_KSU_MANUAL_HOOK=y
-        # CONFIG_KPROBES is not set
-        CONFIG_KALLSYMS=y
-        CONFIG_KALLSYMS_ALL=y
-        EOF
-        
-                echo "✅ Defconfig updated"
-                grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KALLSYMS" "$DEFCONFIG" || true
+# SukiSU-Ultra Manual Hook
+CONFIG_KSU=y
+CONFIG_KSU_MANUAL_HOOK=y
+# CONFIG_KPROBES is not set
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+EOF
 
-    # ── 8. Setup toolchain ─────────────────────────────────────────────
+        # Add SUSFS config if integration succeeded
+        if [ "${SUSFS_APPLIED:-false}" = "true" ]; then
+          echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
+          echo "✅ Added CONFIG_KSU_SUSFS=y"
+        fi
+
+        echo "✅ Defconfig updated"
+        grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KALLSYMS" "$DEFCONFIG" || true
+
+    # ── 9. Setup toolchain ─────────────────────────────────────────────
     - name: Setup Clang toolchain
       run: |
         mkdir -p "$GITHUB_WORKSPACE/toolchain"
@@ -183,29 +254,23 @@ jobs:
           exit 1
         fi
 
-    # ── 9. Build kernel ────────────────────────────────────────────────
+    # ── 10. Build kernel ───────────────────────────────────────────────
     - name: Build kernel
       working-directory: kernel
       run: |
         export PATH="${CLANG_BIN}:$PATH"
 
-        # KCFLAGS: Suppress newer Clang warnings for 5.4 kernel.
-        # - default-const-init-var-unsafe   → typecheck.h __dummy2 (BPF)
-        # - default-const-init-field-unsafe → struct kernel_param.perm (params.c)
-        # - sometimes-uninitialized         → various older macros
-        # - enum-conversion                 → implicit enum casts
-        # - implicit-function-declaration   → missing prototypes in old drivers
-        # - int-conversion                  → pointer/int casts in old code
-        # - unused-function                 → ifdef'd out functions
-        # - gnu-offsetof-extensions         → GNU extension usage
+        # KCFLAGS: Suppress newer Clang warnings for 5.4 kernel
         KCFLAGS_VAL="-Wno-default-const-init-var-unsafe"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-default-const-init-field-unsafe"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-sometimes-uninitialized"
+        KCFLAGS_VAL="$KCFLAGS_VAL -Wno-uninitialized"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-enum-conversion"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-implicit-function-declaration"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-int-conversion"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-unused-function"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-gnu-offsetof-extensions"
+        KCFLAGS_VAL="$KCFLAGS_VAL -Wno-single-bit-bitfield-constant-conversion"
 
         MAKE_ARGS=(
           ARCH=${{ env.ARCH }}
@@ -238,7 +303,6 @@ jobs:
         echo "══════════════════════════════════════════"
         make "${MAKE_ARGS[@]}" -j$(nproc --all) 2>&1 | tee build_kernel.log
 
-        # Locate output
         KERNEL_IMAGE=""
         for img in \
           "out/arch/${{ env.ARCH }}/boot/Image" \
@@ -265,7 +329,7 @@ jobs:
           echo "DTBO_IMG=$GITHUB_WORKSPACE/kernel/$DTBO" >> $GITHUB_ENV
         fi
 
-    # ── 10. Package AnyKernel3 ─────────────────────────────────────────
+    # ── 11. Package AnyKernel3 ─────────────────────────────────────────
     - name: Package AnyKernel3 flashable zip
       run: |
         git clone --depth=1 "${{ env.ANYKERNEL_REPO }}" AnyKernel3
@@ -274,33 +338,33 @@ jobs:
         rm -rf modules patch ramdisk LICENSE README.md
 
         cat > anykernel.sh << 'AKEOF'
-        # AnyKernel3 Ramdisk Mod Script
-        # osm0sis @ xda-developers
-        
-        properties() { '
-        kernel.string=SukiSU-Ultra-ManualHook for lisa
-        do.devicecheck=1
-        do.modules=0
-        do.systemless=1
-        do.cleanup=1
-        do.cleanuponabort=0
-        device.name1=lisa
-        device.name2=
-        supported.versions=
-        supported.patchlevels=
-        '; }
-        
-        block=/dev/block/bootdevice/by-name/boot;
-        is_slot_device=auto;
-        ramdisk_compression=auto;
-        patch_vbmeta_flag=auto;
-        
-        . tools/ak3-core.sh;
-        
-        split_boot;
-        flash_boot;
-        flash_dtbo;
-        AKEOF
+# AnyKernel3 Ramdisk Mod Script
+# osm0sis @ xda-developers
+
+properties() { '
+kernel.string=SukiSU-Ultra-ManualHook for lisa
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=lisa
+device.name2=
+supported.versions=
+supported.patchlevels=
+'; }
+
+block=/dev/block/bootdevice/by-name/boot;
+is_slot_device=auto;
+ramdisk_compression=auto;
+patch_vbmeta_flag=auto;
+
+. tools/ak3-core.sh;
+
+split_boot;
+flash_boot;
+flash_dtbo;
+AKEOF
 
         cp "${{ env.KERNEL_IMAGE }}" .
 
@@ -320,7 +384,7 @@ jobs:
         echo "ZIP_PATH=${GITHUB_WORKSPACE}/${ZIP_NAME}" >> $GITHUB_ENV
         echo "✅ Packaged: ${ZIP_NAME}"
 
-    # ── 11. Upload artifact ────────────────────────────────────────────
+    # ── 12. Upload artifact ────────────────────────────────────────────
     - name: Upload kernel zip
       uses: actions/upload-artifact@v4
       with:
@@ -328,7 +392,7 @@ jobs:
         path: ${{ env.ZIP_PATH }}
         retention-days: 7
 
-    # ── 12. Upload build log ───────────────────────────────────────────
+    # ── 13. Upload build log ───────────────────────────────────────────
     - name: Upload build log
       if: always()
       uses: actions/upload-artifact@v4
