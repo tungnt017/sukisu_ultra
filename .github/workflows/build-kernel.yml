@@ -62,26 +62,29 @@ jobs:
           ${{ env.KERNEL_REPO }} kernel
         echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel" >> $GITHUB_ENV
 
-    # ── 4. Integrate SukiSU-Ultra ──────────────────────────────────────
-    - name: Setup SukiSU-Ultra (builtin mode)
+    # ── 4. Integrate SukiSU-Ultra (LKM mode via bash -s main) ─────────
+    #
+    # NOTE: Using `bash -s main` (not `bash -s builtin`).
+    # This sets up SukiSU-Ultra as a Loadable Kernel Module.
+    #
+    - name: Setup SukiSU-Ultra
       working-directory: kernel
       run: |
         curl -LSs \
           "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ inputs.sukisu_branch }}/kernel/setup.sh" \
-          | bash -s builtin
-        echo "✅ SukiSU-Ultra integrated (branch: ${{ inputs.sukisu_branch }})"
+          | bash -s main
+        echo "✅ SukiSU-Ultra integrated (branch: ${{ inputs.sukisu_branch }}, mode: main)"
 
     # ── 5. Integrate SUSFS (required by SukiSU-Ultra main branch) ──────
     #
-    # SukiSU-Ultra's ksu.c includes <linux/susfs.h> which requires the
-    # susfs4ksu kernel patches. If patches fail, create a stub header.
+    # SukiSU-Ultra includes <linux/susfs.h> and <linux/susfs_def.h>.
+    # Try full susfs4ksu integration; fall back to stub headers.
     #
     - name: Integrate SUSFS
       working-directory: kernel
       run: |
         echo "📦 Integrating SUSFS..."
 
-        # Determine kernel version for correct susfs patch
         KERNEL_VER=$(make kernelversion 2>/dev/null | cut -d. -f1-2)
         echo "Kernel version: $KERNEL_VER"
 
@@ -91,10 +94,9 @@ jobs:
         if git clone --depth=1 https://gitlab.com/simonpunk/susfs4ksu.git "$GITHUB_WORKSPACE/susfs4ksu" 2>/dev/null; then
           echo "✅ susfs4ksu cloned"
 
-          # Find matching kernel patch
+          # Try to apply kernel patch
           SUSFS_PATCH=""
           for p in \
-            "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch" \
             "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-${KERNEL_VER}.patch" \
             "$GITHUB_WORKSPACE/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-5.4.patch"; do
             if [ -f "$p" ]; then
@@ -124,30 +126,59 @@ jobs:
               patch -p1 --forward --no-backup-if-mismatch < "$KSU_SUSFS_PATCH" 2>/dev/null || true
           fi
 
-          # Copy susfs header if available
-          SUSFS_H=$(find "$GITHUB_WORKSPACE/susfs4ksu" -name "susfs.h" -path "*/include/*" -type f 2>/dev/null | head -1)
-          if [ -n "$SUSFS_H" ] && [ ! -f "include/linux/susfs.h" ]; then
-            cp "$SUSFS_H" include/linux/susfs.h
-            echo "✅ Copied susfs.h to include/linux/"
-          fi
+          # Copy susfs headers if available
+          for hdr in susfs.h susfs_def.h susfs_redirect.h; do
+            SRC=$(find "$GITHUB_WORKSPACE/susfs4ksu" -name "$hdr" -path "*/include/*" -type f 2>/dev/null | head -1)
+            if [ -n "$SRC" ] && [ ! -f "include/linux/$hdr" ]; then
+              cp "$SRC" "include/linux/$hdr"
+              echo "✅ Copied $hdr to include/linux/"
+            fi
+          done
         else
           echo "⚠️ Could not clone susfs4ksu"
         fi
 
-        # Fallback: create stub header if susfs.h still doesn't exist
+        # ── Fallback: create stub headers if still missing ──
         if [ ! -f "include/linux/susfs.h" ]; then
-          echo "📝 Creating stub susfs.h (susfs not fully integrated)"
+          echo "📝 Creating stub include/linux/susfs.h"
           cat > include/linux/susfs.h << 'STUBEOF'
-        #ifndef _LINUX_SUSFS_H
-        #define _LINUX_SUSFS_H
-        /* Stub header — susfs not integrated in this build */
-        #endif /* _LINUX_SUSFS_H */
-        STUBEOF
-          sed -i 's/^        //' include/linux/susfs.h
+#ifndef _LINUX_SUSFS_H
+#define _LINUX_SUSFS_H
+#include <linux/types.h>
+#endif /* _LINUX_SUSFS_H */
+STUBEOF
+        fi
+
+        if [ ! -f "include/linux/susfs_def.h" ]; then
+          echo "📝 Creating stub include/linux/susfs_def.h"
+          cat > include/linux/susfs_def.h << 'STUBEOF'
+#ifndef _LINUX_SUSFS_DEF_H
+#define _LINUX_SUSFS_DEF_H
+#endif /* _LINUX_SUSFS_DEF_H */
+STUBEOF
+        fi
+
+        if [ ! -f "include/linux/susfs_redirect.h" ]; then
+          echo "📝 Creating stub include/linux/susfs_redirect.h"
+          cat > include/linux/susfs_redirect.h << 'STUBEOF'
+#ifndef _LINUX_SUSFS_REDIRECT_H
+#define _LINUX_SUSFS_REDIRECT_H
+#endif /* _LINUX_SUSFS_REDIRECT_H */
+STUBEOF
         fi
 
         echo "SUSFS_APPLIED=$SUSFS_APPLIED" >> $GITHUB_ENV
-        echo "✅ SUSFS integration step complete (applied=$SUSFS_APPLIED)"
+
+        # Verify all headers exist
+        echo "── SUSFS headers check ──"
+        for hdr in susfs.h susfs_def.h susfs_redirect.h; do
+          if [ -f "include/linux/$hdr" ]; then
+            echo "  ✅ include/linux/$hdr"
+          else
+            echo "  ❌ include/linux/$hdr MISSING"
+          fi
+        done
+        echo "✅ SUSFS integration complete (full=$SUSFS_APPLIED)"
 
     # ── 6. Apply manual hooks ──────────────────────────────────────────
     - name: Apply manual hook insertions
@@ -169,6 +200,15 @@ jobs:
           if grep -q 'typeof(x) __dummy2;' "$TYPECHECK"; then
             sed -i 's/typeof(x) __dummy2;/typeof(x) __dummy2 = (typeof(x))0;/' "$TYPECHECK"
             echo "✅ Fixed typecheck.h"
+          fi
+        fi
+
+        # Fix 2: sde_hw_dsc_1_2.c — missing return type on function
+        DSC_FILE="techpack/display/msm/sde/sde_hw_dsc_1_2.c"
+        if [ -f "$DSC_FILE" ]; then
+          if grep -q '^static inline _dsc_subblk_offset' "$DSC_FILE"; then
+            sed -i 's/^static inline _dsc_subblk_offset/static inline int _dsc_subblk_offset/' "$DSC_FILE"
+            echo "✅ Fixed sde_hw_dsc_1_2.c: added int return type"
           fi
         fi
 
@@ -199,25 +239,30 @@ jobs:
         DEFCONFIG_NAME=$(basename "$DEFCONFIG")
         echo "DEFCONFIG_NAME=$DEFCONFIG_NAME" >> $GITHUB_ENV
 
+        # Remove conflicting entries
         sed -i '/CONFIG_KSU/d'           "$DEFCONFIG"
         sed -i '/CONFIG_KPROBES/d'       "$DEFCONFIG"
         sed -i '/CONFIG_HAVE_KPROBES/d'  "$DEFCONFIG"
         sed -i '/CONFIG_KPROBE_EVENTS/d' "$DEFCONFIG"
 
+        # Append SukiSU-Ultra config
         cat >> "$DEFCONFIG" << 'EOF'
 
-        # SukiSU-Ultra Manual Hook
-        CONFIG_KSU=y
-        CONFIG_KSU_MANUAL_HOOK=y
-        # CONFIG_KPROBES is not set
-        CONFIG_KALLSYMS=y
-        CONFIG_KALLSYMS_ALL=y
-        EOF
+# SukiSU-Ultra Manual Hook
+CONFIG_KSU=y
+CONFIG_KSU_MANUAL_HOOK=y
+# CONFIG_KPROBES is not set
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+EOF
 
-        # Add SUSFS config if integration succeeded
+        # SUSFS config
         if [ "${SUSFS_APPLIED:-false}" = "true" ]; then
           echo "CONFIG_KSU_SUSFS=y" >> "$DEFCONFIG"
           echo "✅ Added CONFIG_KSU_SUSFS=y"
+        else
+          echo "# CONFIG_KSU_SUSFS is not set" >> "$DEFCONFIG"
+          echo "ℹ️  SUSFS disabled (stub headers only)"
         fi
 
         echo "✅ Defconfig updated"
@@ -260,13 +305,14 @@ jobs:
       run: |
         export PATH="${CLANG_BIN}:$PATH"
 
-        # KCFLAGS: Suppress newer Clang warnings for 5.4 kernel
+        # KCFLAGS: Suppress newer Clang warnings for 5.4 kernel (11 flags)
         KCFLAGS_VAL="-Wno-default-const-init-var-unsafe"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-default-const-init-field-unsafe"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-sometimes-uninitialized"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-uninitialized"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-enum-conversion"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-implicit-function-declaration"
+        KCFLAGS_VAL="$KCFLAGS_VAL -Wno-implicit-int"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-int-conversion"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-unused-function"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-gnu-offsetof-extensions"
@@ -316,8 +362,8 @@ jobs:
 
         if [ -z "$KERNEL_IMAGE" ]; then
           echo "❌ Kernel build FAILED — no Image found!"
-          echo "── Last 80 lines of build log ──"
-          tail -80 build_kernel.log
+          echo "── Last 100 lines of build log ──"
+          tail -100 build_kernel.log
           exit 1
         fi
 
@@ -338,33 +384,33 @@ jobs:
         rm -rf modules patch ramdisk LICENSE README.md
 
         cat > anykernel.sh << 'AKEOF'
-        # AnyKernel3 Ramdisk Mod Script
-        # osm0sis @ xda-developers
-        
-        properties() { '
-        kernel.string=SukiSU-Ultra-ManualHook for lisa
-        do.devicecheck=1
-        do.modules=0
-        do.systemless=1
-        do.cleanup=1
-        do.cleanuponabort=0
-        device.name1=lisa
-        device.name2=
-        supported.versions=
-        supported.patchlevels=
-        '; }
-        
-        block=/dev/block/bootdevice/by-name/boot;
-        is_slot_device=auto;
-        ramdisk_compression=auto;
-        patch_vbmeta_flag=auto;
-        
-        . tools/ak3-core.sh;
-        
-        split_boot;
-        flash_boot;
-        flash_dtbo;
-        AKEOF
+# AnyKernel3 Ramdisk Mod Script
+# osm0sis @ xda-developers
+
+properties() { '
+kernel.string=SukiSU-Ultra-ManualHook for lisa
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=lisa
+device.name2=
+supported.versions=
+supported.patchlevels=
+'; }
+
+block=/dev/block/bootdevice/by-name/boot;
+is_slot_device=auto;
+ramdisk_compression=auto;
+patch_vbmeta_flag=auto;
+
+. tools/ak3-core.sh;
+
+split_boot;
+flash_boot;
+flash_dtbo;
+AKEOF
 
         cp "${{ env.KERNEL_IMAGE }}" .
 
