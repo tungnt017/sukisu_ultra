@@ -1,0 +1,340 @@
+name: Build Kernel Lisa + SukiSU-Ultra (Manual Hook)
+
+on:
+  workflow_dispatch:
+    inputs:
+      sukisu_branch:
+        description: 'SukiSU-Ultra branch'
+        required: true
+        default: 'main'
+        type: choice
+        options:
+          - main
+          - susfs-main
+          - susfs-test
+      apply_optional_patches:
+        description: 'Apply optional patches (input hook + path_umount)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      clang_version:
+        description: 'Clang toolchain'
+        required: true
+        default: 'proton'
+        type: choice
+        options:
+          - proton
+          - zyc
+
+env:
+  KERNEL_REPO: https://github.com/PixelExperience-Devices/kernel_xiaomi_lisa
+  KERNEL_BRANCH: thirteen
+  DEVICE: lisa
+  DEFCONFIG: lisa_defconfig
+  ARCH: arm64
+  ANYKERNEL_REPO: https://github.com/osm0sis/AnyKernel3
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+    # ── 1. Checkout this repo (patches + workflow) ─────────────────────
+    - name: Checkout workflow repo
+      uses: actions/checkout@v4
+
+    # ── 2. Install dependencies ────────────────────────────────────────
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y --no-install-recommends \
+          bc bison build-essential ca-certificates cpio curl flex \
+          git gnupg2 libelf-dev libncurses-dev libssl-dev lld llvm \
+          python3 python-is-python3 unzip wget zip zstd
+
+    # ── 3. Clone kernel source ─────────────────────────────────────────
+    - name: Clone kernel source
+      run: |
+        git clone --depth=1 -b ${{ env.KERNEL_BRANCH }} \
+          ${{ env.KERNEL_REPO }} kernel
+        echo "KERNEL_DIR=$GITHUB_WORKSPACE/kernel" >> $GITHUB_ENV
+
+    # ── 4. Integrate SukiSU-Ultra ──────────────────────────────────────
+    - name: Setup SukiSU-Ultra (builtin mode)
+      working-directory: kernel
+      run: |
+        curl -LSs \
+          "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/${{ inputs.sukisu_branch }}/kernel/setup.sh" \
+          | bash -s builtin
+        echo "✅ SukiSU-Ultra integrated (branch: ${{ inputs.sukisu_branch }})"
+
+    # ── 5. Apply manual hook patches ───────────────────────────────────
+    - name: Apply manual hook patches
+      working-directory: kernel
+      run: |
+        apply_patch() {
+          local patch_file="$1"
+          local patch_name=$(basename "$patch_file")
+          echo "──────────────────────────────────────────"
+          echo "📌 Applying: $patch_name"
+
+          # Level 1: git apply (strict)
+          if git apply --check "$patch_file" 2>/dev/null; then
+            git apply "$patch_file"
+            echo "✅ $patch_name applied (git apply)"
+            return 0
+          fi
+
+          # Level 2: git apply --3way (fuzzy)
+          if git apply --3way "$patch_file" 2>/dev/null; then
+            echo "✅ $patch_name applied (git apply --3way)"
+            return 0
+          fi
+
+          # Level 3: patch -p1 (traditional)
+          if patch -p1 --forward --no-backup-if-mismatch < "$patch_file"; then
+            echo "✅ $patch_name applied (patch -p1)"
+            return 0
+          fi
+
+          echo "❌ FAILED to apply: $patch_name"
+          return 1
+        }
+
+        PATCH_DIR="${GITHUB_WORKSPACE}/patches"
+
+        # Required patches
+        for p in 01-exec-hook.patch 02-open-hook.patch \
+                 03-read_write-hook.patch 04-stat-hook.patch; do
+          apply_patch "$PATCH_DIR/$p"
+        done
+
+        # Optional patches
+        if [ "${{ inputs.apply_optional_patches }}" = "true" ]; then
+          for p in 05-input-hook.patch; do
+            apply_patch "$PATCH_DIR/$p" || true
+          done
+        fi
+
+        echo "✅ All patches applied"
+
+    # ── 6. Modify defconfig ────────────────────────────────────────────
+    - name: Modify defconfig
+      working-directory: kernel
+      run: |
+        DEFCONFIG_PATH="arch/${{ env.ARCH }}/configs/${{ env.DEFCONFIG }}"
+
+        if [ ! -f "$DEFCONFIG_PATH" ]; then
+          echo "❌ Defconfig not found at $DEFCONFIG_PATH"
+          # Fallback: search for it
+          DEFCONFIG_PATH=$(find arch/${{ env.ARCH }}/configs -name "${{ env.DEFCONFIG }}" | head -1)
+          if [ -z "$DEFCONFIG_PATH" ]; then
+            echo "❌ Cannot find ${{ env.DEFCONFIG }} anywhere!"
+            exit 1
+          fi
+          echo "📌 Found defconfig at: $DEFCONFIG_PATH"
+        fi
+
+        echo "📝 Modifying: $DEFCONFIG_PATH"
+
+        # Remove conflicting entries
+        sed -i '/CONFIG_KSU/d' "$DEFCONFIG_PATH"
+        sed -i '/CONFIG_KPROBES/d' "$DEFCONFIG_PATH"
+        sed -i '/CONFIG_HAVE_KPROBES/d' "$DEFCONFIG_PATH"
+        sed -i '/CONFIG_KPROBE_EVENTS/d' "$DEFCONFIG_PATH"
+
+        # Append SukiSU-Ultra config
+        cat >> "$DEFCONFIG_PATH" << 'EOF'
+
+        # SukiSU-Ultra Manual Hook
+        CONFIG_KSU=y
+        CONFIG_KSU_MANUAL_HOOK=y
+        # CONFIG_KPROBES is not set
+        CONFIG_KALLSYMS=y
+        CONFIG_KALLSYMS_ALL=y
+        EOF
+
+        # Remove leading whitespace from appended lines
+        sed -i 's/^        //' "$DEFCONFIG_PATH"
+
+        echo "✅ Defconfig updated"
+        echo "── Checking KSU-related entries ──"
+        grep -E "CONFIG_KSU|CONFIG_KPROBES|CONFIG_KALLSYMS" "$DEFCONFIG_PATH" || true
+
+    # ── 7. Setup toolchain ─────────────────────────────────────────────
+    - name: Setup Clang toolchain
+      run: |
+        mkdir -p "$GITHUB_WORKSPACE/toolchain"
+
+        if [ "${{ inputs.clang_version }}" = "proton" ]; then
+          echo "📦 Cloning Proton Clang..."
+          git clone --depth=1 \
+            https://github.com/kdrag0n/proton-clang.git \
+            "$GITHUB_WORKSPACE/toolchain/clang"
+
+        elif [ "${{ inputs.clang_version }}" = "zyc" ]; then
+          echo "📦 Downloading ZyCromerZ Clang..."
+          mkdir -p "$GITHUB_WORKSPACE/toolchain/clang"
+          ZYC_URL=$(curl -s https://raw.githubusercontent.com/ZyCromerZ/Clang/main/Clang-main-link.txt)
+          wget -q "$ZYC_URL" -O zyc-clang.tar.gz
+          tar -xf zyc-clang.tar.gz -C "$GITHUB_WORKSPACE/toolchain/clang"
+          rm -f zyc-clang.tar.gz
+        fi
+
+        # Verify clang
+        CLANG_BIN="$GITHUB_WORKSPACE/toolchain/clang/bin"
+        echo "PATH=$CLANG_BIN:$PATH" >> $GITHUB_ENV
+        echo "CLANG_BIN=$CLANG_BIN" >> $GITHUB_ENV
+        ls "$CLANG_BIN/clang" && echo "✅ Clang ready" || echo "❌ Clang not found"
+
+    # ── 8. Build kernel ────────────────────────────────────────────────
+    - name: Build kernel
+      working-directory: kernel
+      run: |
+        export PATH="${CLANG_BIN}:$PATH"
+
+        MAKE_ARGS=(
+          ARCH=${{ env.ARCH }}
+          SUBARCH=${{ env.ARCH }}
+          CC=clang
+          CROSS_COMPILE=aarch64-linux-gnu-
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          CLANG_TRIPLE=aarch64-linux-gnu-
+          AR=llvm-ar
+          NM=llvm-nm
+          OBJCOPY=llvm-objcopy
+          OBJDUMP=llvm-objdump
+          STRIP=llvm-strip
+          LD=ld.lld
+          O=out
+        )
+
+        echo "══════════════════════════════════════════"
+        echo "  Building: ${{ env.DEFCONFIG }}"
+        echo "══════════════════════════════════════════"
+
+        # Generate .config
+        make "${MAKE_ARGS[@]}" ${{ env.DEFCONFIG }} 2>&1 | tee build_defconfig.log
+
+        # Verify KSU config
+        echo "── Checking .config for KSU ──"
+        grep -E "CONFIG_KSU" out/.config || true
+
+        # Build kernel image + DTBs
+        echo "══════════════════════════════════════════"
+        echo "  Compiling kernel..."
+        echo "══════════════════════════════════════════"
+        make "${MAKE_ARGS[@]}" -j$(nproc --all) 2>&1 | tee build_kernel.log
+
+        # Check output
+        KERNEL_IMAGE="out/arch/${{ env.ARCH }}/boot/Image"
+        if [ -f "$KERNEL_IMAGE" ]; then
+          echo "✅ Kernel Image built successfully!"
+          ls -lh "$KERNEL_IMAGE"
+        elif [ -f "out/arch/${{ env.ARCH }}/boot/Image.gz" ]; then
+          KERNEL_IMAGE="out/arch/${{ env.ARCH }}/boot/Image.gz"
+          echo "✅ Kernel Image.gz built successfully!"
+          ls -lh "$KERNEL_IMAGE"
+        else
+          echo "❌ Kernel build FAILED — no Image found!"
+          echo "── Last 50 lines of build log ──"
+          tail -50 build_kernel.log
+          exit 1
+        fi
+
+        echo "KERNEL_IMAGE=$KERNEL_IMAGE" >> $GITHUB_ENV
+
+        # Collect DTBs (if any)
+        DTB_DIR="out/arch/${{ env.ARCH }}/boot/dts"
+        DTBO_IMG="out/arch/${{ env.ARCH }}/boot/dtbo.img"
+        if [ -f "$DTBO_IMG" ]; then
+          echo "DTBO_IMG=$DTBO_IMG" >> $GITHUB_ENV
+        fi
+
+    # ── 9. Package with AnyKernel3 ─────────────────────────────────────
+    - name: Package AnyKernel3 flashable zip
+      run: |
+        git clone --depth=1 "${{ env.ANYKERNEL_REPO }}" AnyKernel3
+
+        cd AnyKernel3
+
+        # Clean demo files
+        rm -rf modules patch ramdisk LICENSE README.md
+
+        # Configure anykernel.sh for lisa
+        cat > anykernel.sh << 'AKEOF'
+        # AnyKernel3 Ramdisk Mod Script
+        # osm0sis @ xda-developers
+
+        properties() { '
+        kernel.string=SukiSU-Ultra-ManualHook for lisa
+        do.devicecheck=1
+        do.modules=0
+        do.systemless=1
+        do.cleanup=1
+        do.cleanuponabort=0
+        device.name1=lisa
+        device.name2=
+        supported.versions=
+        supported.patchlevels=
+        '; }
+
+        block=/dev/block/bootdevice/by-name/boot;
+        is_slot_device=auto;
+        ramdisk_compression=auto;
+        patch_vbmeta_flag=auto;
+
+        . tools/ak3-core.sh;
+
+        split_boot;
+        flash_boot;
+        flash_dtbo;
+        AKEOF
+
+        # Remove leading whitespace
+        sed -i 's/^        //' anykernel.sh
+
+        # Copy kernel image
+        cp "${{ env.KERNEL_IMAGE }}" .
+
+        # Copy DTBO if available
+        if [ -n "${{ env.DTBO_IMG }}" ] && [ -f "${{ env.DTBO_IMG }}" ]; then
+          cp "${{ env.DTBO_IMG }}" .
+        fi
+
+        # Copy DTBs if present
+        DTB_DIR="${GITHUB_WORKSPACE}/kernel/out/arch/${{ env.ARCH }}/boot/dts"
+        if [ -d "$DTB_DIR/vendor/qcom" ]; then
+          find "$DTB_DIR/vendor/qcom" -name "*.dtb" -exec cat {} + > dtb 2>/dev/null || true
+        fi
+
+        # Create flashable zip
+        TIMESTAMP=$(date +%Y%m%d-%H%M)
+        ZIP_NAME="SukiSU-Ultra-ManualHook-${{ env.DEVICE }}-${TIMESTAMP}.zip"
+        zip -r9 "../${ZIP_NAME}" . -x '.git*'
+        echo "ZIP_NAME=${ZIP_NAME}" >> $GITHUB_ENV
+        echo "ZIP_PATH=${GITHUB_WORKSPACE}/${ZIP_NAME}" >> $GITHUB_ENV
+        echo "✅ Packaged: ${ZIP_NAME}"
+
+    # ── 10. Upload artifact ────────────────────────────────────────────
+    - name: Upload kernel zip
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ZIP_NAME }}
+        path: ${{ env.ZIP_PATH }}
+        retention-days: 7
+
+    # ── 11. Upload build log ───────────────────────────────────────────
+    - name: Upload build log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-logs
+        path: |
+          kernel/build_defconfig.log
+          kernel/build_kernel.log
+        retention-days: 3
