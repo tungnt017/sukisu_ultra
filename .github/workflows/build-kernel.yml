@@ -306,6 +306,7 @@ jobs:
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-unused-function"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-gnu-offsetof-extensions"
         KCFLAGS_VAL="$KCFLAGS_VAL -Wno-single-bit-bitfield-constant-conversion"
+        KCFLAGS_VAL="$KCFLAGS_VAL -Wno-array-parameter"
 
         MAKE_ARGS=(
           ARCH=${{ env.ARCH }}
