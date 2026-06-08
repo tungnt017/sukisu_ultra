@@ -1,0 +1,643 @@
+name: "🔧 Repack Boot Image (SukiSU-Ultra Kernel)"
+
+on:
+  workflow_dispatch:
+    inputs:
+      stock_boot_url:
+        description: "📦 Direct URL to stock boot.img (or leave empty & place in repo root)"
+        required: false
+        default: ""
+      kernel_build_run_id:
+        description: "🔗 Kernel build workflow Run ID (to download Image artifact)"
+        required: false
+        default: ""
+      kernel_image_url:
+        description: "📦 Direct URL to kernel Image/Image.gz (if no Run ID)"
+        required: false
+        default: ""
+      device_codename:
+        description: "📱 Device codename"
+        required: true
+        default: "lisa"
+      magiskboot_version:
+        description: "🔮 Magisk release tag for magiskboot (e.g. v28.1, canary)"
+        required: true
+        default: "v28.1"
+      patch_vbmeta:
+        description: "🔓 Patch vbmeta flags in boot header (disable verity/verification)"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+env:
+  WORK_DIR: ${{ github.workspace }}/repack_work
+
+jobs:
+  repack-boot:
+    name: "🔧 Repack boot.img with custom kernel"
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 0. Checkout ──────────────────────────────────────────
+      - name: "📥 Checkout repository"
+        uses: actions/checkout@v4
+
+      # ── 1. Setup workspace ───────────────────────────────────
+      - name: "📂 Setup workspace"
+        run: |
+          mkdir -p $WORK_DIR/{stock,kernel,output,tools}
+          echo "✅ Workspace created at $WORK_DIR"
+          ls -la $WORK_DIR/
+
+      # ── 2. Download magiskboot ───────────────────────────────
+      - name: "🔮 Download magiskboot"
+        run: |
+          cd $WORK_DIR/tools
+
+          MAGISK_TAG="${{ github.event.inputs.magiskboot_version }}"
+          echo "📥 Downloading Magisk $MAGISK_TAG ..."
+
+          if [ "$MAGISK_TAG" = "canary" ]; then
+            MAGISK_URL="https://raw.githubusercontent.com/topjohnwu/magisk-files/canary/app-release.apk"
+          else
+            MAGISK_URL="https://github.com/topjohnwu/Magisk/releases/download/${MAGISK_TAG}/Magisk-${MAGISK_TAG}.apk"
+          fi
+
+          curl -L -o magisk.apk "$MAGISK_URL" || {
+            echo "⚠️ Primary URL failed, trying alternate..."
+            curl -L -o magisk.apk "https://github.com/topjohnwu/Magisk/releases/latest/download/Magisk-v28.1.apk"
+          }
+
+          # Extract magiskboot from APK (it's a ZIP)
+          unzip -o magisk.apk lib/x86_64/libmagiskboot.so -d . 2>/dev/null || \
+          unzip -o magisk.apk lib/x86/libmagiskboot.so -d . 2>/dev/null
+
+          if [ -f lib/x86_64/libmagiskboot.so ]; then
+            mv lib/x86_64/libmagiskboot.so ./magiskboot
+          elif [ -f lib/x86/libmagiskboot.so ]; then
+            mv lib/x86/libmagiskboot.so ./magiskboot
+          else
+            echo "❌ Could not find magiskboot in Magisk APK!"
+            echo "📋 APK contents:"
+            unzip -l magisk.apk | grep -i magiskboot || true
+            # Fallback: try assets
+            unzip -o magisk.apk assets/magiskboot -d . 2>/dev/null && mv assets/magiskboot ./magiskboot || {
+              echo "❌ FATAL: Cannot extract magiskboot"
+              exit 1
+            }
+          fi
+
+          chmod +x ./magiskboot
+          ./magiskboot 2>&1 | head -5 || true
+          echo "✅ magiskboot ready!"
+          rm -rf lib assets magisk.apk
+
+      # ── 3. Get stock boot.img ────────────────────────────────
+      - name: "📱 Get stock boot.img"
+        run: |
+          cd $WORK_DIR/stock
+
+          BOOT_URL="${{ github.event.inputs.stock_boot_url }}"
+
+          if [ -n "$BOOT_URL" ]; then
+            echo "📥 Downloading stock boot.img from URL..."
+            curl -L -o stock_boot.img "$BOOT_URL"
+          elif [ -f "${{ github.workspace }}/stock_boot.img" ]; then
+            echo "📁 Using stock_boot.img from repository root"
+            cp "${{ github.workspace }}/stock_boot.img" ./stock_boot.img
+          else
+            echo ""
+            echo "════════════════════════════════════════════════════"
+            echo "❌ ERROR: No stock boot.img provided!"
+            echo ""
+            echo "Please provide stock boot.img using ONE of these methods:"
+            echo ""
+            echo "  1️⃣  Set 'stock_boot_url' input to a direct download URL"
+            echo ""
+            echo "  2️⃣  Add stock_boot.img to your repository root"
+            echo ""
+            echo "  3️⃣  Upload stock_boot.img as a Release asset and"
+            echo "      use the download URL"
+            echo ""
+            echo "📖 How to get stock boot.img:"
+            echo "  • Extract from official ROM ZIP (boot.img inside)"
+            echo "  • Dump from device: adb shell su -c"
+            echo "    'dd if=/dev/block/bootdevice/by-name/boot of=/sdcard/stock_boot.img'"
+            echo "    then: adb pull /sdcard/stock_boot.img"
+            echo "  • Get from firmware sites (xiaomifirmwareupdater.com)"
+            echo "════════════════════════════════════════════════════"
+            exit 1
+          fi
+
+          FILE_SIZE=$(stat -c%s stock_boot.img 2>/dev/null || echo "0")
+          echo "📊 stock_boot.img size: $FILE_SIZE bytes ($(numfmt --to=iec $FILE_SIZE))"
+
+          # Basic validation
+          if [ "$FILE_SIZE" -lt 1000000 ]; then
+            echo "⚠️ WARNING: boot.img seems too small (<1MB). Is this correct?"
+          fi
+
+          # Check magic bytes
+          MAGIC=$(xxd -l 8 -p stock_boot.img)
+          echo "🔍 Magic bytes: $MAGIC"
+          if [[ "$MAGIC" == "414e44524f494421"* ]]; then
+            echo "✅ Valid Android boot image detected (ANDROID!)"
+          else
+            echo "⚠️ WARNING: Unexpected magic bytes. File may not be a valid boot.img"
+          fi
+
+      # ── 4. Get kernel Image (FIXED v2) ──────────────────────
+      - name: "🐧 Get kernel Image"
+        run: |
+          cd $WORK_DIR/kernel
+
+          RUN_ID="${{ github.event.inputs.kernel_build_run_id }}"
+          IMAGE_URL="${{ github.event.inputs.kernel_image_url }}"
+
+          # ─── Method A: Direct URL ───
+          if [ -n "$IMAGE_URL" ]; then
+            echo "📥 Downloading kernel Image from URL..."
+            curl -L -o Image "$IMAGE_URL"
+
+          # ─── Method B: From workflow run artifacts ───
+          elif [ -n "$RUN_ID" ]; then
+            echo "📥 Downloading artifacts from workflow run $RUN_ID..."
+
+            # Download ALL artifacts from that run
+            gh run download "$RUN_ID" \
+              --repo "${{ github.repository }}" \
+              --dir ./artifact/ 2>&1 || {
+              echo "❌ FATAL: Cannot download artifacts from run $RUN_ID"
+              echo "Make sure the Run ID is correct and artifacts haven't expired (90 days)"
+              exit 1
+            }
+
+            echo ""
+            echo "📋 All downloaded files:"
+            find ./artifact/ -type f | sort
+            echo ""
+
+            # ─── Find the actual AnyKernel3 ZIP file (not directory) ───
+            echo "🔍 Searching for AnyKernel3 ZIP..."
+            AK_ZIP=""
+            while IFS= read -r candidate; do
+              if file "$candidate" | grep -qi "zip\|archive"; then
+                AK_ZIP="$candidate"
+                echo "✅ Found valid ZIP: $AK_ZIP"
+                break
+              else
+                echo "  ⏭️ Skipping (not a ZIP): $candidate"
+              fi
+            done < <(find ./artifact/ -name "*.zip" -type f 2>/dev/null)
+
+            if [ -z "$AK_ZIP" ]; then
+              echo ""
+              echo "⚠️ No .zip file found. Searching for raw Image files in artifacts..."
+              FOUND_IMG=$(find ./artifact/ -type f \( -name "Image" -o -name "Image.gz" -o -name "zImage" -o -name "kernel" \) | head -1)
+              if [ -n "$FOUND_IMG" ]; then
+                echo "✅ Found raw kernel: $FOUND_IMG"
+                cp "$FOUND_IMG" ./
+              else
+                echo "❌ FATAL: No kernel Image or ZIP found in artifacts!"
+                echo "📋 All files:"
+                find ./artifact/ -type f -exec ls -lh {} \;
+                exit 1
+              fi
+            else
+              # ─── List ZIP contents ───
+              echo ""
+              echo "📋 ZIP contents:"
+              unzip -l "$AK_ZIP"
+              echo ""
+
+              # ─── Extract everything from ZIP ───
+              mkdir -p ./extracted
+              unzip -o "$AK_ZIP" -d ./extracted/
+              echo ""
+              echo "📋 Extracted files:"
+              find ./extracted/ -type f | sort
+              echo ""
+
+              # ─── Search for kernel image with various names ───
+              KERNEL_FOUND=""
+              for kname in Image Image.gz Image.lz4 zImage zImage-dtb kernel vmlinux; do
+                MATCH=$(find ./extracted/ -name "$kname" -type f | head -1)
+                if [ -n "$MATCH" ]; then
+                  echo "✅ Found kernel image: $MATCH ($(stat -c%s "$MATCH" | numfmt --to=iec))"
+                  cp "$MATCH" "./$kname"
+                  KERNEL_FOUND="$kname"
+                  break
+                fi
+              done
+
+              # ─── Fallback: find largest file (likely kernel) ───
+              if [ -z "$KERNEL_FOUND" ]; then
+                echo "⚠️ No standard kernel name found. Looking for largest file..."
+                LARGEST=$(find ./extracted/ -type f -exec ls -S {} + | head -1)
+                if [ -n "$LARGEST" ]; then
+                  LSIZE=$(stat -c%s "$LARGEST")
+                  echo "  Largest file: $LARGEST ($LSIZE bytes)"
+                  if [ "$LSIZE" -gt 5000000 ]; then
+                    echo "  ✅ Likely a kernel image (>5MB). Using it."
+                    cp "$LARGEST" ./Image
+                    KERNEL_FOUND="Image"
+                  else
+                    echo "  ❌ Largest file too small to be a kernel."
+                  fi
+                fi
+              fi
+
+              if [ -z "$KERNEL_FOUND" ]; then
+                echo "❌ FATAL: Could not find kernel image in AnyKernel3 ZIP!"
+                echo "📋 ZIP file list:"
+                find ./extracted/ -type f -exec ls -lh {} \;
+                exit 1
+              fi
+
+              # Clean up
+              rm -rf ./extracted ./artifact
+            fi
+
+          # ─── Method C: From repository root ───
+          elif [ -f "${{ github.workspace }}/Image" ]; then
+            echo "📁 Using Image from repository root"
+            cp "${{ github.workspace }}/Image" ./Image
+
+          elif [ -f "${{ github.workspace }}/Image.gz" ]; then
+            echo "📁 Using Image.gz from repository root"
+            cp "${{ github.workspace }}/Image.gz" ./Image.gz
+
+          else
+            echo "❌ ERROR: No kernel Image provided!"
+            echo ""
+            echo "Please provide Image using ONE of these methods:"
+            echo "  1️⃣  Set 'kernel_image_url' to direct download URL"
+            echo "  2️⃣  Set 'kernel_build_run_id' to download from previous build"
+            echo "  3️⃣  Place Image or Image.gz in repository root"
+            exit 1
+          fi
+
+          # ─── Decompress if needed ───
+          if [ -f Image.gz ] && [ ! -f Image ]; then
+            echo "📦 Decompressing Image.gz → Image..."
+            gzip -dk Image.gz
+          fi
+
+          if [ -f Image.lz4 ] && [ ! -f Image ]; then
+            echo "📦 Decompressing Image.lz4 → Image..."
+            lz4 -d Image.lz4 Image
+          fi
+
+          # ─── Final check ───
+          if [ ! -f Image ]; then
+            echo "❌ FATAL: Image file not found after all attempts!"
+            echo "📋 Files in kernel dir:"
+            ls -la
+            exit 1
+          fi
+
+          ls -lh Image
+          echo ""
+          echo "✅ Kernel Image ready! ($(stat -c%s Image | numfmt --to=iec))"
+          echo "   SHA256: $(sha256sum Image | cut -d' ' -f1)"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      # ── 5. Analyze stock boot.img ────────────────────────────
+      - name: "🔍 Analyze stock boot.img"
+        run: |
+          cd $WORK_DIR/stock
+
+          echo "════════════════════════════════════════════════════"
+          echo "📊 STOCK BOOT.IMG ANALYSIS"
+          echo "════════════════════════════════════════════════════"
+
+          $WORK_DIR/tools/magiskboot unpack -h stock_boot.img 2>&1 | tee ../stock_header.txt || true
+
+          echo ""
+          echo "📋 Unpacking stock boot.img..."
+          $WORK_DIR/tools/magiskboot unpack -n stock_boot.img 2>&1 | tee -a ../stock_header.txt
+
+          echo ""
+          echo "📂 Extracted components:"
+          ls -lh
+          echo ""
+
+          # Document what we have
+          for f in kernel ramdisk.cpio dtb kernel_dtb extra; do
+            if [ -f "$f" ]; then
+              echo "  ✅ $f ($(stat -c%s $f | numfmt --to=iec))"
+            fi
+          done
+
+          # Save original kernel hash for comparison
+          if [ -f kernel ]; then
+            sha256sum kernel | tee ../stock_kernel_hash.txt
+            echo ""
+            echo "📊 Stock kernel size: $(stat -c%s kernel | numfmt --to=iec)"
+          fi
+
+      # ── 6. Replace kernel ────────────────────────────────────
+      - name: "🔄 Replace kernel with SukiSU-Ultra build"
+        run: |
+          cd $WORK_DIR/stock
+
+          echo "📊 Size comparison:"
+          echo "  Stock kernel:  $(stat -c%s kernel 2>/dev/null | numfmt --to=iec || echo 'N/A')"
+          echo "  New kernel:    $(stat -c%s $WORK_DIR/kernel/Image | numfmt --to=iec)"
+
+          # Backup stock kernel
+          cp kernel kernel.stock.bak
+
+          # Replace with new kernel
+          cp $WORK_DIR/kernel/Image kernel
+
+          echo ""
+          echo "✅ Kernel replaced!"
+          echo "  New kernel hash: $(sha256sum kernel | cut -d' ' -f1)"
+
+      # ── 7. Repack boot.img ──────────────────────────────────
+      - name: "📦 Repack new boot.img"
+        run: |
+          cd $WORK_DIR/stock
+
+          echo "════════════════════════════════════════════════════"
+          echo "📦 REPACKING BOOT.IMG"
+          echo "════════════════════════════════════════════════════"
+
+          # Patch vbmeta flags if requested
+          if [ "${{ github.event.inputs.patch_vbmeta }}" = "true" ]; then
+            echo "🔓 Patching vbmeta flags (disable verity + verification)..."
+            $WORK_DIR/tools/magiskboot hexpatch stock_boot.img \
+              49dff461 01000000 2>/dev/null || echo "  ℹ️ vbmeta patch skipped (pattern not found or already patched)"
+          fi
+
+          # Repack
+          $WORK_DIR/tools/magiskboot repack stock_boot.img $WORK_DIR/output/new-boot.img
+          RESULT=$?
+
+          if [ $RESULT -ne 0 ]; then
+            echo "❌ FATAL: magiskboot repack failed with exit code $RESULT"
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ Repack successful!"
+
+      # ── 8. Verify new boot.img ──────────────────────────────
+      - name: "✅ Verify new boot.img"
+        run: |
+          cd $WORK_DIR/output
+
+          echo "════════════════════════════════════════════════════"
+          echo "🔍 NEW BOOT.IMG VERIFICATION"
+          echo "════════════════════════════════════════════════════"
+
+          ls -lh new-boot.img
+          echo ""
+
+          # Verify by unpacking
+          mkdir -p verify && cd verify
+          $WORK_DIR/tools/magiskboot unpack -h ../new-boot.img 2>&1 | tee ../../new_header.txt
+          $WORK_DIR/tools/magiskboot unpack -n ../new-boot.img 2>&1 | tee -a ../../new_header.txt
+
+          echo ""
+          echo "📊 Verification results:"
+          if [ -f kernel ]; then
+            NEW_HASH=$(sha256sum kernel | cut -d' ' -f1)
+            EXPECTED_HASH=$(sha256sum $WORK_DIR/kernel/Image | cut -d' ' -f1)
+            echo "  New boot kernel hash:    $NEW_HASH"
+            echo "  Expected kernel hash:    $EXPECTED_HASH"
+            if [ "$NEW_HASH" = "$EXPECTED_HASH" ]; then
+              echo "  ✅ KERNEL MATCH - boot.img contains the correct kernel!"
+            else
+              echo "  ❌ KERNEL MISMATCH - something went wrong!"
+              exit 1
+            fi
+          fi
+
+          echo ""
+          echo "📊 Size comparison:"
+          echo "  Stock boot.img: $(stat -c%s $WORK_DIR/stock/stock_boot.img | numfmt --to=iec)"
+          echo "  New boot.img:   $(stat -c%s $WORK_DIR/output/new-boot.img | numfmt --to=iec)"
+
+          cd ..
+          rm -rf verify
+
+      # ── 9. Create flash package ─────────────────────────────
+      - name: "📦 Create flash package"
+        run: |
+          DEVICE="${{ github.event.inputs.device_codename }}"
+          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          PKG_DIR="$WORK_DIR/output/flash_package"
+          mkdir -p "$PKG_DIR"
+
+          # Copy boot image
+          cp $WORK_DIR/output/new-boot.img "$PKG_DIR/"
+
+          # Create fastboot flash script (Linux/macOS)
+          cat > "$PKG_DIR/flash_boot.sh" << 'FLASH_SH'
+#!/bin/bash
+# ============================================================
+# 🔧 Flash new-boot.img via fastboot
+# ============================================================
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BOOT_IMG="$SCRIPT_DIR/new-boot.img"
+
+if [ ! -f "$BOOT_IMG" ]; then
+    echo "❌ new-boot.img not found!"
+    exit 1
+fi
+
+echo "════════════════════════════════════════════════════"
+echo "⚠️  WARNING: This will flash a custom boot image!"
+echo "   Make sure you have a backup of your stock boot.img"
+echo "════════════════════════════════════════════════════"
+echo ""
+
+# Check fastboot
+if ! command -v fastboot &>/dev/null; then
+    echo "❌ fastboot not found. Install Android platform-tools first."
+    exit 1
+fi
+
+# Check device
+echo "🔍 Waiting for device in fastboot mode..."
+echo "   (Reboot to bootloader: adb reboot bootloader)"
+fastboot devices
+
+read -p "❓ Continue flashing? (y/N): " confirm
+if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+    echo "❌ Cancelled."
+    exit 0
+fi
+
+echo ""
+echo "📱 Flashing new-boot.img..."
+fastboot flash boot "$BOOT_IMG"
+
+echo ""
+read -p "❓ Reboot now? (y/N): " reboot_confirm
+if [ "$reboot_confirm" = "y" ] || [ "$reboot_confirm" = "Y" ]; then
+    fastboot reboot
+    echo "✅ Device rebooting..."
+else
+    echo "ℹ️  Run 'fastboot reboot' when ready."
+fi
+FLASH_SH
+          chmod +x "$PKG_DIR/flash_boot.sh"
+
+          # Create Windows batch script
+          cat > "$PKG_DIR/flash_boot.bat" << 'FLASH_BAT'
+@echo off
+echo ============================================================
+echo    Flash new-boot.img via fastboot
+echo    WARNING: This will flash a custom boot image!
+echo    Make sure you have a backup of your stock boot.img
+echo ============================================================
+echo.
+
+if not exist "%~dp0new-boot.img" (
+    echo ERROR: new-boot.img not found!
+    pause
+    exit /b 1
+)
+
+echo Checking fastboot...
+fastboot devices
+if errorlevel 1 (
+    echo ERROR: No device found. Make sure device is in fastboot mode.
+    pause
+    exit /b 1
+)
+
+echo.
+set /p confirm="Continue flashing? (y/N): "
+if /i not "%confirm%"=="y" (
+    echo Cancelled.
+    pause
+    exit /b 0
+)
+
+echo.
+echo Flashing new-boot.img...
+fastboot flash boot "%~dp0new-boot.img"
+
+echo.
+set /p reboot="Reboot now? (y/N): "
+if /i "%reboot%"=="y" (
+    fastboot reboot
+    echo Device rebooting...
+)
+
+pause
+FLASH_BAT
+
+          # Create README for the package
+          cat > "$PKG_DIR/README.txt" << EOF
+================================================================
+  SukiSU-Ultra Custom Boot Image
+  Device: ${DEVICE}
+  Built:  ${TIMESTAMP}
+================================================================
+
+FILES:
+  new-boot.img      - Custom boot image with SukiSU-Ultra kernel
+  flash_boot.sh     - Flash script for Linux/macOS
+  flash_boot.bat    - Flash script for Windows
+
+HOW TO FLASH:
+  1. Backup your current boot.img first!
+  2. Boot device into fastboot mode:
+       adb reboot bootloader
+  3. Flash:
+       fastboot flash boot new-boot.img
+  4. Reboot:
+       fastboot reboot
+
+HOW TO REVERT:
+  Flash your stock_boot.img backup:
+       fastboot flash boot stock_boot.img
+       fastboot reboot
+
+NOTES:
+  - Make sure bootloader is unlocked
+  - After flashing, if device bootloops:
+    Hold Power + Vol Down to enter fastboot
+    Flash stock boot.img to recover
+================================================================
+EOF
+
+          # Create ZIP
+          cd "$PKG_DIR"
+          ZIP_NAME="new-boot-${DEVICE}-${TIMESTAMP}.zip"
+          zip -r "$WORK_DIR/output/$ZIP_NAME" .
+          echo "✅ Flash package created: $ZIP_NAME"
+
+          # Create build info
+          cat > "$WORK_DIR/output/build_info.txt" << EOF
+═══════════════════════════════════════════
+  Boot Image Repack Summary
+═══════════════════════════════════════════
+Device:           ${DEVICE}
+Build Time:       ${TIMESTAMP}
+Magisk Version:   ${{ github.event.inputs.magiskboot_version }}
+VBMeta Patched:   ${{ github.event.inputs.patch_vbmeta }}
+Stock Boot URL:   ${{ github.event.inputs.stock_boot_url }}
+Kernel Run ID:    ${{ github.event.inputs.kernel_build_run_id }}
+Kernel Image URL: ${{ github.event.inputs.kernel_image_url }}
+Repository:       ${{ github.repository }}
+Workflow Run:     ${{ github.run_id }}
+
+Stock boot hash:  $(sha256sum $WORK_DIR/stock/stock_boot.img | cut -d' ' -f1)
+New boot hash:    $(sha256sum $WORK_DIR/output/new-boot.img | cut -d' ' -f1)
+Kernel hash:      $(sha256sum $WORK_DIR/kernel/Image | cut -d' ' -f1)
+═══════════════════════════════════════════
+EOF
+          cat "$WORK_DIR/output/build_info.txt"
+
+      # ── 10. Upload artifacts ─────────────────────────────────
+      - name: "📤 Upload new-boot.img"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "new-boot-${{ github.event.inputs.device_codename }}"
+          path: |
+            ${{ env.WORK_DIR }}/output/new-boot.img
+            ${{ env.WORK_DIR }}/output/build_info.txt
+          retention-days: 30
+
+      - name: "📤 Upload flash package (ZIP)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "flash-package-${{ github.event.inputs.device_codename }}"
+          path: ${{ env.WORK_DIR }}/output/new-boot-*.zip
+          retention-days: 30
+
+      # ── 11. Summary ─────────────────────────────────────────
+      - name: "📊 Build Summary"
+        run: |
+          DEVICE="${{ github.event.inputs.device_codename }}"
+          echo ""
+          echo "╔══════════════════════════════════════════════════╗"
+          echo "║  ✅ BOOT IMAGE REPACK COMPLETE!                  ║"
+          echo "╚══════════════════════════════════════════════════╝"
+          echo ""
+          echo "📦 Artifacts uploaded:"
+          echo "   • new-boot-${DEVICE}         → new-boot.img + build info"
+          echo "   • flash-package-${DEVICE}    → ZIP with flash scripts"
+          echo ""
+          echo "📱 How to flash:"
+          echo "   1. Download the artifact ZIP"
+          echo "   2. Extract new-boot.img"
+          echo "   3. adb reboot bootloader"
+          echo "   4. fastboot flash boot new-boot.img"
+          echo "   5. fastboot reboot"
+          echo ""
+          echo "⚠️ IMPORTANT:"
+          echo "   • Backup stock boot.img BEFORE flashing!"
+          echo "   • If bootloop: Power+VolDown → fastboot → flash stock boot"
