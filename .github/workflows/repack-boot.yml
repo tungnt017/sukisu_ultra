@@ -366,167 +366,167 @@ jobs:
 
           # Create fastboot flash script (Linux/macOS)
           cat > "$PKG_DIR/flash_boot.sh" << 'FLASH_SH'
-#!/bin/bash
-# ============================================================
-# 🔧 Flash new-boot.img via fastboot
-# Device: $DEVICE
-# ============================================================
-set -e
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BOOT_IMG="$SCRIPT_DIR/new-boot.img"
-
-if [ ! -f "$BOOT_IMG" ]; then
-    echo "❌ new-boot.img not found!"
-    exit 1
-fi
-
-echo "════════════════════════════════════════════════════"
-echo "⚠️  WARNING: This will flash a custom boot image!"
-echo "   Make sure you have a backup of your stock boot.img"
-echo "════════════════════════════════════════════════════"
-echo ""
-
-# Check fastboot
-if ! command -v fastboot &>/dev/null; then
-    echo "❌ fastboot not found. Install Android platform-tools first."
-    exit 1
-fi
-
-# Check device
-echo "🔍 Waiting for device in fastboot mode..."
-echo "   (Reboot to bootloader: adb reboot bootloader)"
-fastboot devices
-
-read -p "❓ Continue flashing? (y/N): " confirm
-if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
-    echo "❌ Cancelled."
-    exit 0
-fi
-
-echo ""
-echo "📱 Flashing new-boot.img..."
-fastboot flash boot "$BOOT_IMG"
-
-echo ""
-read -p "❓ Reboot now? (y/N): " reboot_confirm
-if [ "$reboot_confirm" = "y" ] || [ "$reboot_confirm" = "Y" ]; then
-    fastboot reboot
-    echo "✅ Device rebooting..."
-else
-    echo "ℹ️  Run 'fastboot reboot' when ready."
-fi
-FLASH_SH
-          chmod +x "$PKG_DIR/flash_boot.sh"
-
-          # Create Windows batch script
-          cat > "$PKG_DIR/flash_boot.bat" << 'FLASH_BAT'
-@echo off
-echo ============================================================
-echo    Flash new-boot.img via fastboot
-echo    WARNING: This will flash a custom boot image!
-echo    Make sure you have a backup of your stock boot.img
-echo ============================================================
-echo.
-
-if not exist "%~dp0new-boot.img" (
-    echo ERROR: new-boot.img not found!
-    pause
-    exit /b 1
-)
-
-echo Checking fastboot...
-fastboot devices
-if errorlevel 1 (
-    echo ERROR: No device found. Make sure device is in fastboot mode.
-    pause
-    exit /b 1
-)
-
-echo.
-set /p confirm="Continue flashing? (y/N): "
-if /i not "%confirm%"=="y" (
-    echo Cancelled.
-    pause
-    exit /b 0
-)
-
-echo.
-echo Flashing new-boot.img...
-fastboot flash boot "%~dp0new-boot.img"
-
-echo.
-set /p reboot="Reboot now? (y/N): "
-if /i "%reboot%"=="y" (
-    fastboot reboot
-    echo Device rebooting...
-)
-
-pause
-FLASH_BAT
-
-          # Create README for the package
-          cat > "$PKG_DIR/README.txt" << EOF
-================================================================
-  SukiSU-Ultra Custom Boot Image
-  Device: ${DEVICE}
-  Built:  ${TIMESTAMP}
-================================================================
-
-FILES:
-  new-boot.img      - Custom boot image with SukiSU-Ultra kernel
-  flash_boot.sh     - Flash script for Linux/macOS
-  flash_boot.bat    - Flash script for Windows
-
-HOW TO FLASH:
-  1. Backup your current boot.img first!
-  2. Boot device into fastboot mode:
-       adb reboot bootloader
-  3. Flash:
-       fastboot flash boot new-boot.img
-  4. Reboot:
-       fastboot reboot
-
-HOW TO REVERT:
-  Flash your stock_boot.img backup:
-       fastboot flash boot stock_boot.img
-       fastboot reboot
-
-NOTES:
-  - Make sure bootloader is unlocked
-  - After flashing, if device bootloops:
-    Hold Power + Vol Down to enter fastboot
-    Flash stock boot.img to recover
-================================================================
-EOF
-
-          # Create ZIP
-          cd "$PKG_DIR"
-          ZIP_NAME="new-boot-${DEVICE}-${TIMESTAMP}.zip"
-          zip -r "$WORK_DIR/output/$ZIP_NAME" .
-          echo "✅ Flash package created: $ZIP_NAME"
-
-          # Create build info
-          cat > "$WORK_DIR/output/build_info.txt" << EOF
-═══════════════════════════════════════════
-  Boot Image Repack Summary
-═══════════════════════════════════════════
-Device:           ${DEVICE}
-Build Time:       ${TIMESTAMP}
-Magisk Version:   ${{ github.event.inputs.magiskboot_version }}
-VBMeta Patched:   ${{ github.event.inputs.patch_vbmeta }}
-Stock Boot URL:   ${{ github.event.inputs.stock_boot_url }}
-Kernel Run ID:    ${{ github.event.inputs.kernel_build_run_id }}
-Kernel Image URL: ${{ github.event.inputs.kernel_image_url }}
-Repository:       ${{ github.repository }}
-Workflow Run:     ${{ github.run_id }}
-
-Stock boot hash:  $(sha256sum $WORK_DIR/stock/stock_boot.img | cut -d' ' -f1)
-New boot hash:    $(sha256sum $WORK_DIR/output/new-boot.img | cut -d' ' -f1)
-Kernel hash:      $(sha256sum $WORK_DIR/kernel/Image | cut -d' ' -f1)
-═══════════════════════════════════════════
-EOF
-          cat "$WORK_DIR/output/build_info.txt"
+          #!/bin/bash
+          # ============================================================
+          # 🔧 Flash new-boot.img via fastboot
+          # Device: $DEVICE
+          # ============================================================
+          set -e
+          
+          SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+          BOOT_IMG="$SCRIPT_DIR/new-boot.img"
+          
+          if [ ! -f "$BOOT_IMG" ]; then
+              echo "❌ new-boot.img not found!"
+              exit 1
+          fi
+          
+          echo "════════════════════════════════════════════════════"
+          echo "⚠️  WARNING: This will flash a custom boot image!"
+          echo "   Make sure you have a backup of your stock boot.img"
+          echo "════════════════════════════════════════════════════"
+          echo ""
+          
+          # Check fastboot
+          if ! command -v fastboot &>/dev/null; then
+              echo "❌ fastboot not found. Install Android platform-tools first."
+              exit 1
+          fi
+          
+          # Check device
+          echo "🔍 Waiting for device in fastboot mode..."
+          echo "   (Reboot to bootloader: adb reboot bootloader)"
+          fastboot devices
+          
+          read -p "❓ Continue flashing? (y/N): " confirm
+          if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
+              echo "❌ Cancelled."
+              exit 0
+          fi
+          
+          echo ""
+          echo "📱 Flashing new-boot.img..."
+          fastboot flash boot "$BOOT_IMG"
+          
+          echo ""
+          read -p "❓ Reboot now? (y/N): " reboot_confirm
+          if [ "$reboot_confirm" = "y" ] || [ "$reboot_confirm" = "Y" ]; then
+              fastboot reboot
+              echo "✅ Device rebooting..."
+          else
+              echo "ℹ️  Run 'fastboot reboot' when ready."
+          fi
+          FLASH_SH
+                    chmod +x "$PKG_DIR/flash_boot.sh"
+          
+                    # Create Windows batch script
+                    cat > "$PKG_DIR/flash_boot.bat" << 'FLASH_BAT'
+          @echo off
+          echo ============================================================
+          echo    Flash new-boot.img via fastboot
+          echo    WARNING: This will flash a custom boot image!
+          echo    Make sure you have a backup of your stock boot.img
+          echo ============================================================
+          echo.
+          
+          if not exist "%~dp0new-boot.img" (
+              echo ERROR: new-boot.img not found!
+              pause
+              exit /b 1
+          )
+          
+          echo Checking fastboot...
+          fastboot devices
+          if errorlevel 1 (
+              echo ERROR: No device found. Make sure device is in fastboot mode.
+              pause
+              exit /b 1
+          )
+          
+          echo.
+          set /p confirm="Continue flashing? (y/N): "
+          if /i not "%confirm%"=="y" (
+              echo Cancelled.
+              pause
+              exit /b 0
+          )
+          
+          echo.
+          echo Flashing new-boot.img...
+          fastboot flash boot "%~dp0new-boot.img"
+          
+          echo.
+          set /p reboot="Reboot now? (y/N): "
+          if /i "%reboot%"=="y" (
+              fastboot reboot
+              echo Device rebooting...
+          )
+          
+          pause
+          FLASH_BAT
+          
+                    # Create README for the package
+                    cat > "$PKG_DIR/README.txt" << EOF
+          ================================================================
+            SukiSU-Ultra Custom Boot Image
+            Device: ${DEVICE}
+            Built:  ${TIMESTAMP}
+          ================================================================
+          
+          FILES:
+            new-boot.img      - Custom boot image with SukiSU-Ultra kernel
+            flash_boot.sh     - Flash script for Linux/macOS
+            flash_boot.bat    - Flash script for Windows
+          
+          HOW TO FLASH:
+            1. Backup your current boot.img first!
+            2. Boot device into fastboot mode:
+                 adb reboot bootloader
+            3. Flash:
+                 fastboot flash boot new-boot.img
+            4. Reboot:
+                 fastboot reboot
+          
+          HOW TO REVERT:
+            Flash your stock_boot.img backup:
+                 fastboot flash boot stock_boot.img
+                 fastboot reboot
+          
+          NOTES:
+            - Make sure bootloader is unlocked
+            - After flashing, if device bootloops:
+              Hold Power + Vol Down to enter fastboot
+              Flash stock boot.img to recover
+          ================================================================
+          EOF
+          
+                    # Create ZIP
+                    cd "$PKG_DIR"
+                    ZIP_NAME="new-boot-${DEVICE}-${TIMESTAMP}.zip"
+                    zip -r "$WORK_DIR/output/$ZIP_NAME" .
+                    echo "✅ Flash package created: $ZIP_NAME"
+          
+                    # Create build info
+                    cat > "$WORK_DIR/output/build_info.txt" << EOF
+          ═══════════════════════════════════════════
+            Boot Image Repack Summary
+          ═══════════════════════════════════════════
+          Device:           ${DEVICE}
+          Build Time:       ${TIMESTAMP}
+          Magisk Version:   ${{ github.event.inputs.magiskboot_version }}
+          VBMeta Patched:   ${{ github.event.inputs.patch_vbmeta }}
+          Stock Boot URL:   ${{ github.event.inputs.stock_boot_url }}
+          Kernel Run ID:    ${{ github.event.inputs.kernel_build_run_id }}
+          Kernel Image URL: ${{ github.event.inputs.kernel_image_url }}
+          Repository:       ${{ github.repository }}
+          Workflow Run:     ${{ github.run_id }}
+          
+          Stock boot hash:  $(sha256sum $WORK_DIR/stock/stock_boot.img | cut -d' ' -f1)
+          New boot hash:    $(sha256sum $WORK_DIR/output/new-boot.img | cut -d' ' -f1)
+          Kernel hash:      $(sha256sum $WORK_DIR/kernel/Image | cut -d' ' -f1)
+          ═══════════════════════════════════════════
+          EOF
+                    cat "$WORK_DIR/output/build_info.txt"
 
       # ── 10. Upload artifacts ─────────────────────────────────
       - name: "📤 Upload new-boot.img"
